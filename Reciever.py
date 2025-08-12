@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 2 Receiver - phase2_receiver.py
+Phase 2 Multi-Sender Receiver - phase2_receiver.py
 
-Listens on TCP, receives FILE_INIT, METADATA, and PART packets from Phase 1,
-acknowledges each packet, reassembles Base64 chunks into original JPEG (lossless),
-verifies file checksum, saves to Phase 2's input directories.
+Enhanced receiver that handles multiple senders simultaneously,
+maintains sender isolation, and triggers incremental reconstruction.
 """
 
 import argparse
@@ -18,10 +17,13 @@ import json
 import logging
 import os
 import sys
+import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, NamedTuple
+from typing import Dict, List, Tuple, Optional, NamedTuple, Set
 from datetime import datetime, timezone
-import fcntl
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import queue
 
 # Constants
 MAX_PACKET_SIZE = 2048
@@ -35,36 +37,94 @@ class FileTransfer(NamedTuple):
     file_md5: str
     total_parts: int
     status: str
+    sender_id: str
 
-class PacketPart(NamedTuple):
-    file_id: str
-    part_index: int
-    chunk_md5: str
-    status: str
+class SenderState:
+    """Track state for individual senders."""
+    
+    def __init__(self, sender_id: str, base_dir: Path):
+        self.sender_id = sender_id
+        self.base_dir = base_dir
+        self.images_dir = base_dir / 'images'
+        self.metadata_dir = base_dir / 'metadata'
+        self.output_dir = Path('output') / sender_id
+        self.batch_dir = self.output_dir / 'batch_001'
+        
+        # State tracking
+        self.initial_scene_received = False
+        self.initial_scene_path = None
+        self.pending_objects = set()  # New object files since last reconstruction
+        self.reconstruction_lock = threading.Lock()
+        self.last_reconstruction_time = 0
+        self.reconstruction_queue = queue.Queue()
+        
+        # Create directories
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.batch_dir.mkdir(parents=True, exist_ok=True)
+    
+    def add_pending_object(self, filename: str):
+        """Add new object to pending reconstruction queue."""
+        self.pending_objects.add(filename)
+    
+    def clear_pending_objects(self):
+        """Clear pending objects after reconstruction."""
+        self.pending_objects.clear()
+    
+    def should_trigger_reconstruction(self) -> bool:
+        """Check if reconstruction should be triggered."""
+        return (self.initial_scene_received and 
+                len(self.pending_objects) > 0)
+    
+    def get_reconstruction_args(self, debug_mode: bool = False) -> List[str]:
+        """Get arguments for 2 phase final reconstruction with proper boolean formatting."""
+        args = [
+            sys.executable, '2 phase final.py',
+            '--input-dir', str(self.base_dir),
+            '--output-dir', str(self.output_dir),
+            '--scene-image', 'initial_scene.jpg',
+            '--batch-dir', str(self.batch_dir),
+            '--sender-id', self.sender_id
+        ]
+        
+        # Add debug mode if requested
+        if debug_mode:
+            args.append('--debug-mode')  # This is also a store_true flag
+        
+        return args
 
-class Phase2Receiver:
+class MultiSenderPhase2Receiver:
     def __init__(self, args):
         self.args = args
         self.running = True
         self.db_lock = threading.Lock()
         self.json_lock = threading.Lock()
+        self.senders_lock = threading.Lock()
+        
+        # Multi-sender state management
+        self.senders: Dict[str, SenderState] = {}
+        self.reconstruction_executor = ThreadPoolExecutor(max_workers=args.max_reconstruction_workers)
+        self.reconstruction_timers: Dict[str, threading.Timer] = {}
+        
+        # Base directories
+        self.received_data_dir = Path(args.received_data_dir)
+        self.received_data_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup logging
         self.setup_logging()
         
-        # Initialize directories
-        self.setup_directories()
-        
         # Initialize database
         self.init_database()
         
-        # Load processed images tracking
+        # Load global processed images tracking
         self.load_processed_images()
         
-        self.logger.info(f"Phase 2 Receiver initialized")
+        self.logger.info(f"Multi-Sender Phase 2 Receiver initialized")
         self.logger.info(f"  Listen address: {self.args.listen_host}:{self.args.listen_port}")
-        self.logger.info(f"  Input directory: {self.args.input_dir}")
-        self.logger.info(f"  Receive queue: {self.args.receive_queue}")
+        self.logger.info(f"  Received data directory: {self.args.received_data_dir}")
+        self.logger.info(f"  Max reconstruction workers: {self.args.max_reconstruction_workers}")
+        self.logger.info(f"  Reconstruction delay: {self.args.reconstruction_delay}s")
     
     def setup_logging(self):
         """Setup logging configuration."""
@@ -82,24 +142,16 @@ class Phase2Receiver:
         
         self.logger = logging.getLogger(self.__class__.__name__)
     
-    def setup_directories(self):
-        """Ensure required directories exist."""
-        Path(self.args.input_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.args.input_dir, 'images').mkdir(parents=True, exist_ok=True)
-        Path(self.args.input_dir, 'metadata').mkdir(parents=True, exist_ok=True)
-        Path(self.args.receive_queue).mkdir(parents=True, exist_ok=True)
-        
-        # Ensure processed JSON directory exists
-        Path(self.args.processed_json).parent.mkdir(parents=True, exist_ok=True)
-    
     def init_database(self):
-        """Initialize SQLite database for receive state."""
+        """Initialize SQLite database with sender support."""
         self.db_path = Path(self.args.db_path)
         
         with sqlite3.connect(self.db_path) as conn:
+            # Files table with sender_id
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS files (
                     file_id TEXT PRIMARY KEY,
+                    sender_id TEXT NOT NULL,
                     filename TEXT NOT NULL,
                     file_size INTEGER NOT NULL,
                     file_md5 TEXT NOT NULL,
@@ -111,6 +163,7 @@ class Phase2Receiver:
                 )
             ''')
             
+            # Parts table
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS parts (
                     file_id TEXT NOT NULL,
@@ -123,12 +176,25 @@ class Phase2Receiver:
                 )
             ''')
             
+            # Senders table for tracking
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS senders (
+                    sender_id TEXT PRIMARY KEY,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    files_received INTEGER DEFAULT 0,
+                    initial_scene_received BOOLEAN DEFAULT FALSE,
+                    last_reconstruction TIMESTAMP
+                )
+            ''')
+            
             # Add indexes for performance
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_files_sender ON files (sender_id)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_files_status ON files (status)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_parts_status ON parts (status)')
     
     def load_processed_images(self):
-        """Load existing processed images JSON."""
+        """Load existing processed images JSON (global tracking)."""
         self.processed_images = {'processed_images': []}
         
         try:
@@ -147,39 +213,38 @@ class Phase2Receiver:
             self.logger.error(f"Error loading processed images JSON: {e}")
             self.processed_images = {'processed_images': []}
     
-    def update_processed_images(self, file_id: str, filename: str, file_md5: str, saved_path: str, metadata_path: str):
-        """Update processed images JSON with atomic write."""
-        try:
-            with self.json_lock:
-                # Add new entry
-                new_entry = {
-                    'file_id': file_id,
-                    'filename': filename,
-                    'file_md5': file_md5,
-                    'received_at': datetime.now(timezone.utc).isoformat(),
-                    'saved_path': saved_path,
-                    'metadata_path': metadata_path
-                }
+    def get_or_create_sender(self, sender_id: str) -> SenderState:
+        """Get or create sender state."""
+        with self.senders_lock:
+            if sender_id not in self.senders:
+                sender_base_dir = self.received_data_dir / sender_id
+                self.senders[sender_id] = SenderState(sender_id, sender_base_dir)
                 
-                self.processed_images['processed_images'].append(new_entry)
-                self.processed_images['last_updated'] = datetime.now(timezone.utc).isoformat()
+                # Update database
+                with self.db_lock:
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.execute('''
+                            INSERT OR IGNORE INTO senders (sender_id, first_seen, last_activity)
+                            VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ''', (sender_id,))
                 
-                # Write to temporary file then rename (atomic)
-                temp_path = Path(self.args.processed_json).with_suffix('.tmp')
-                with open(temp_path, 'w') as f:
-                    json.dump(self.processed_images, f, indent=2)
-                
-                temp_path.rename(self.args.processed_json)
-                
-                self.logger.info(f"Updated processed images JSON with {filename}")
-                
-        except Exception as e:
-            self.logger.error(f"Error updating processed images JSON: {e}")
+                self.logger.info(f"Created new sender state: {sender_id}")
+            
+            return self.senders[sender_id]
+    
+    def update_sender_activity(self, sender_id: str):
+        """Update sender's last activity timestamp."""
+        with self.db_lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    UPDATE senders 
+                    SET last_activity = CURRENT_TIMESTAMP
+                    WHERE sender_id = ?
+                ''', (sender_id,))
     
     def parse_packet(self, packet_data: str) -> Dict:
         """Parse incoming packet and extract headers and data."""
         try:
-            # Split packet into lines
             lines = packet_data.strip().split('\n')
             
             headers = {}
@@ -211,6 +276,7 @@ class Phase2Receiver:
         """Create ACK packet response."""
         lines = [
             f"TYPE: ACK",
+            f"ORIGINAL_TYPE: {packet_type}",
             f"FILE_ID: {file_id}",
             f"STATUS: {status}",
             f"RECEIVED_AT: {datetime.now(timezone.utc).isoformat()}"
@@ -218,19 +284,6 @@ class Phase2Receiver:
         
         for key, value in kwargs.items():
             lines.append(f"{key.upper()}: {value}")
-        
-        return '\n'.join(lines) + '\n'
-    
-    def create_file_complete_packet(self, file_id: str, file_md5: str, saved_path: str, status: str = 'OK') -> str:
-        """Create FILE_COMPLETE packet."""
-        lines = [
-            f"TYPE: FILE_COMPLETE",
-            f"FILE_ID: {file_id}",
-            f"FILE_MD5: {file_md5}",
-            f"STATUS: {status}",
-            f"SAVED_PATH: {saved_path}",
-            f"COMPLETED_AT: {datetime.now(timezone.utc).isoformat()}"
-        ]
         
         return '\n'.join(lines) + '\n'
     
@@ -244,7 +297,7 @@ class Phase2Receiver:
             self.logger.error(f"Error sending response: {e}")
     
     def handle_file_init(self, conn: socket.socket, parsed: Dict) -> bool:
-        """Handle FILE_INIT packet."""
+        """Handle FILE_INIT packet with sender identification."""
         try:
             headers = parsed['headers']
             
@@ -253,24 +306,28 @@ class Phase2Receiver:
             file_size = int(headers.get('FILE_SIZE', 0))
             file_md5 = headers.get('FILE_MD5')
             total_parts = int(headers.get('TOTAL_PARTS', 0))
+            sender_id = headers.get('SENDER_ID', 'unknown_sender')
             
             if not all([file_id, filename, file_md5]):
                 self.send_response(conn, self.create_ack_packet('FILE_INIT', file_id or 'unknown', 'ERROR', error='missing_required_fields'))
                 return False
             
-            # Create working directory
+            # Get or create sender state
+            sender = self.get_or_create_sender(sender_id)
+            self.update_sender_activity(sender_id)
+            
+            # Create working directory for this transfer
             work_dir = Path(self.args.receive_queue) / file_id
             work_dir.mkdir(parents=True, exist_ok=True)
             
-            # Store file info in database
+            # Store file info in database with sender_id
             with self.db_lock:
                 with sqlite3.connect(self.db_path) as db_conn:
-                    # Insert or update file record
                     db_conn.execute('''
                         INSERT OR REPLACE INTO files 
-                        (file_id, filename, file_size, file_md5, total_parts, status, last_update)
-                        VALUES (?, ?, ?, ?, ?, 'receiving', CURRENT_TIMESTAMP)
-                    ''', (file_id, filename, file_size, file_md5, total_parts))
+                        (file_id, sender_id, filename, file_size, file_md5, total_parts, status, last_update)
+                        VALUES (?, ?, ?, ?, ?, ?, 'receiving', CURRENT_TIMESTAMP)
+                    ''', (file_id, sender_id, filename, file_size, file_md5, total_parts))
                     
                     # Pre-create part records
                     for part_idx in range(total_parts):
@@ -279,10 +336,10 @@ class Phase2Receiver:
                             VALUES (?, ?, '')
                         ''', (file_id, part_idx))
             
-            self.logger.info(f"Initialized file transfer: {filename} ({file_size} bytes, {total_parts} parts)")
+            self.logger.info(f"[{sender_id}] Initialized file transfer: {filename} ({file_size} bytes, {total_parts} parts)")
             
             # Send ACK
-            ack = self.create_ack_packet('FILE_INIT', file_id, 'OK')
+            ack = self.create_ack_packet('FILE_INIT', file_id, 'OK', sender_id=sender_id)
             self.send_response(conn, ack)
             
             return True
@@ -290,21 +347,27 @@ class Phase2Receiver:
         except Exception as e:
             self.logger.error(f"Error handling FILE_INIT: {e}")
             file_id = parsed['headers'].get('FILE_ID', 'unknown')
-            self.send_response(conn, self.create_ack_packet('FILE_INIT', file_id, 'ERROR', error=str(e)))
+            sender_id = parsed['headers'].get('SENDER_ID', 'unknown')
+            self.send_response(conn, self.create_ack_packet('FILE_INIT', file_id, 'ERROR', error=str(e), sender_id=sender_id))
             return False
     
     def handle_metadata(self, conn: socket.socket, parsed: Dict) -> bool:
-        """Handle METADATA packet."""
+        """Handle METADATA packet with sender isolation."""
         try:
             headers = parsed['headers']
             
             file_id = headers.get('FILE_ID')
             filename = headers.get('FILENAME')
+            sender_id = headers.get('SENDER_ID', 'unknown_sender')
             metadata_content = parsed.get('data', '')
             
             if not file_id:
                 self.send_response(conn, self.create_ack_packet('METADATA', 'unknown', 'ERROR', error='missing_file_id'))
                 return False
+            
+            # Get sender state
+            sender = self.get_or_create_sender(sender_id)
+            self.update_sender_activity(sender_id)
             
             # Save metadata to working directory
             work_dir = Path(self.args.receive_queue) / file_id
@@ -347,10 +410,10 @@ class Phase2Receiver:
                 with open(metadata_file, 'w', encoding='utf-8') as f:
                     f.write(metadata_content)
             
-            self.logger.debug(f"Saved metadata for {file_id}")
+            self.logger.debug(f"[{sender_id}] Saved metadata for {file_id}")
             
             # Send ACK
-            ack = self.create_ack_packet('METADATA', file_id, 'OK')
+            ack = self.create_ack_packet('METADATA', file_id, 'OK', sender_id=sender_id)
             self.send_response(conn, ack)
             
             return True
@@ -358,11 +421,12 @@ class Phase2Receiver:
         except Exception as e:
             self.logger.error(f"Error handling METADATA: {e}")
             file_id = parsed['headers'].get('FILE_ID', 'unknown')
-            self.send_response(conn, self.create_ack_packet('METADATA', file_id, 'ERROR', error=str(e)))
+            sender_id = parsed['headers'].get('SENDER_ID', 'unknown')
+            self.send_response(conn, self.create_ack_packet('METADATA', file_id, 'ERROR', error=str(e), sender_id=sender_id))
             return False
     
     def handle_part(self, conn: socket.socket, parsed: Dict) -> bool:
-        """Handle PART packet."""
+        """Handle PART packet with sender isolation."""
         try:
             headers = parsed['headers']
             
@@ -370,6 +434,7 @@ class Phase2Receiver:
             part_info = headers.get('PART', '1/1')
             chunk_len = int(headers.get('CHUNK_LEN', 0))
             chunk_md5 = headers.get('CHUNK_MD5')
+            sender_id = headers.get('SENDER_ID', 'unknown_sender')
             base64_data = parsed.get('data', '')
             
             if not all([file_id, part_info, chunk_md5, base64_data]):
@@ -380,25 +445,28 @@ class Phase2Receiver:
             part_num, total_parts = map(int, part_info.split('/'))
             part_index = part_num - 1  # Convert to 0-based index
             
+            # Get sender state
+            sender = self.get_or_create_sender(sender_id)
+            self.update_sender_activity(sender_id)
+            
             # Decode base64 data
             try:
                 chunk_data = base64.b64decode(base64_data.replace('\n', ''))
             except Exception as e:
-                self.logger.error(f"Error decoding base64 for part {part_num}: {e}")
-                self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error='base64_decode_error'))
+                self.logger.error(f"[{sender_id}] Error decoding base64 for part {part_num}: {e}")
+                self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error='base64_decode_error', sender_id=sender_id))
                 return False
             
-            # Verify chunk length
+            # Verify chunk length and MD5
             if len(chunk_data) != chunk_len:
-                self.logger.error(f"Chunk length mismatch for part {part_num}: expected {chunk_len}, got {len(chunk_data)}")
-                self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error='chunk_length_mismatch'))
+                self.logger.error(f"[{sender_id}] Chunk length mismatch for part {part_num}: expected {chunk_len}, got {len(chunk_data)}")
+                self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error='chunk_length_mismatch', sender_id=sender_id))
                 return False
             
-            # Verify chunk MD5
             actual_md5 = hashlib.md5(chunk_data).hexdigest()
             if actual_md5 != chunk_md5:
-                self.logger.error(f"Chunk MD5 mismatch for part {part_num}: expected {chunk_md5}, got {actual_md5}")
-                self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error='checksum_mismatch'))
+                self.logger.error(f"[{sender_id}] Chunk MD5 mismatch for part {part_num}: expected {chunk_md5}, got {actual_md5}")
+                self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error='checksum_mismatch', sender_id=sender_id))
                 return False
             
             # Save chunk to working directory
@@ -418,10 +486,10 @@ class Phase2Receiver:
                         WHERE file_id = ? AND part_index = ?
                     ''', (chunk_md5, file_id, part_index))
             
-            self.logger.debug(f"Received part {part_num}/{total_parts} for {file_id}")
+            self.logger.debug(f"[{sender_id}] Received part {part_num}/{total_parts} for {file_id}")
             
             # Send ACK
-            ack = self.create_ack_packet('PART', file_id, 'OK', part=part_info)
+            ack = self.create_ack_packet('PART', file_id, 'OK', part=part_info, sender_id=sender_id)
             self.send_response(conn, ack)
             
             # Check if all parts received
@@ -435,23 +503,28 @@ class Phase2Receiver:
                 cursor = db_conn.execute('''
                     SELECT total_parts FROM files WHERE file_id = ?
                 ''', (file_id,))
-                total_parts_db = cursor.fetchone()[0]
+                result = cursor.fetchone()
+                if result:
+                    total_parts_db = result[0]
+                else:
+                    raise ValueError(f"File record not found for {file_id}")
             
             if received_count == total_parts_db:
                 # All parts received, assemble file
-                self.assemble_and_save_file(conn, file_id)
+                self.assemble_and_save_file(conn, file_id, sender_id)
             
             return True
             
         except Exception as e:
             self.logger.error(f"Error handling PART: {e}")
             file_id = parsed['headers'].get('FILE_ID', 'unknown')
+            sender_id = parsed['headers'].get('SENDER_ID', 'unknown')
             part_info = parsed['headers'].get('PART', 'unknown')
-            self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error=str(e)))
+            self.send_response(conn, self.create_ack_packet('PART', file_id, 'ERROR', part=part_info, error=str(e), sender_id=sender_id))
             return False
     
-    def assemble_and_save_file(self, conn: socket.socket, file_id: str):
-        """Assemble all parts and save final file."""
+    def assemble_and_save_file(self, conn: socket.socket, file_id: str, sender_id: str):
+        """Assemble all parts and save final file to sender-specific directory."""
         try:
             # Get file info from database
             with sqlite3.connect(self.db_path) as db_conn:
@@ -467,6 +540,7 @@ class Phase2Receiver:
                 filename, file_size, expected_md5, total_parts = file_info
             
             work_dir = Path(self.args.receive_queue) / file_id
+            sender = self.senders[sender_id]
             
             # Assemble file from parts
             assembled_data = bytearray()
@@ -481,41 +555,54 @@ class Phase2Receiver:
                     part_data = f.read()
                     assembled_data.extend(part_data)
             
-            # Verify assembled file size
+            # Verify assembled file
             if len(assembled_data) != file_size:
                 raise ValueError(f"File size mismatch: expected {file_size}, got {len(assembled_data)}")
             
-            # Verify assembled file MD5
             actual_md5 = hashlib.md5(assembled_data).hexdigest()
             if actual_md5 != expected_md5:
                 raise ValueError(f"File MD5 mismatch: expected {expected_md5}, got {actual_md5}")
             
-            # Save to final location
-            images_dir = Path(self.args.input_dir) / 'images'
-            metadata_dir = Path(self.args.input_dir) / 'metadata'
+            # Determine save location based on file type
+            if filename == 'initial_scene.jpg' or filename.startswith('scene_'):
+                # Save initial scene in sender's root directory
+                final_path = sender.base_dir / filename
+                sender.initial_scene_received = True
+                sender.initial_scene_path = str(final_path)
+                
+                # Update sender database record
+                with self.db_lock:
+                    with sqlite3.connect(self.db_path) as db_conn:
+                        db_conn.execute('''
+                            UPDATE senders 
+                            SET initial_scene_received = TRUE, last_activity = CURRENT_TIMESTAMP
+                            WHERE sender_id = ?
+                        ''', (sender_id,))
+                
+                self.logger.info(f"[{sender_id}] Initial scene received: {filename}")
+                
+            else:
+                # Object image - save to images directory
+                final_path = sender.images_dir / filename
+                sender.add_pending_object(filename)
+                
+                # Also save corresponding metadata
+                metadata_source = work_dir / 'metadata.txt'
+                if metadata_source.exists():
+                    metadata_filename = f"{Path(filename).stem}.txt"
+                    final_metadata_path = sender.metadata_dir / metadata_filename
+                    
+                    with open(metadata_source, 'r', encoding='utf-8') as src:
+                        with open(final_metadata_path, 'w', encoding='utf-8') as dst:
+                            dst.write(src.read())
+                    
+                    self.logger.debug(f"[{sender_id}] Saved metadata: {metadata_filename}")
+                
+                self.logger.info(f"[{sender_id}] Object image received: {filename}")
             
-            final_image_path = images_dir / filename
-            final_metadata_path = metadata_dir / f"{Path(filename).stem}.txt"
-            
-            # Write image file
-            with open(final_image_path, 'wb') as f:
+            # Write assembled file
+            with open(final_path, 'wb') as f:
                 f.write(assembled_data)
-            
-            # Copy metadata file
-            metadata_source = work_dir / 'metadata.txt'
-            if metadata_source.exists():
-                with open(metadata_source, 'r', encoding='utf-8') as src:
-                    with open(final_metadata_path, 'w', encoding='utf-8') as dst:
-                        dst.write(src.read())
-            
-            # Update processed images JSON
-            self.update_processed_images(
-                file_id=file_id,
-                filename=filename,
-                file_md5=actual_md5,
-                saved_path=str(final_image_path),
-                metadata_path=str(final_metadata_path)
-            )
             
             # Update database
             with self.db_lock:
@@ -524,25 +611,34 @@ class Phase2Receiver:
                         UPDATE files 
                         SET status = 'complete', saved_path = ?, last_update = CURRENT_TIMESTAMP
                         WHERE file_id = ?
-                    ''', (str(final_image_path), file_id))
-            
-            self.logger.info(f"Successfully assembled and saved: {filename}")
+                    ''', (str(final_path), file_id))
+                    
+                    # Update sender files count
+                    db_conn.execute('''
+                        UPDATE senders 
+                        SET files_received = files_received + 1, last_activity = CURRENT_TIMESTAMP
+                        WHERE sender_id = ?
+                    ''', (sender_id,))
             
             # Clean up working directory
             if self.args.cleanup_temp:
                 self.cleanup_working_directory(work_dir)
             
+            # Check if reconstruction should be triggered
+            self.schedule_reconstruction_if_needed(sender)
+            
             # Send FILE_COMPLETE response
             complete_response = self.create_file_complete_packet(
                 file_id=file_id,
                 file_md5=actual_md5,
-                saved_path=str(final_image_path),
+                saved_path=str(final_path),
+                sender_id=sender_id,
                 status='OK'
             )
             self.send_response(conn, complete_response)
             
         except Exception as e:
-            self.logger.error(f"Error assembling file {file_id}: {e}")
+            self.logger.error(f"[{sender_id}] Error assembling file {file_id}: {e}")
             
             # Update database to failed status
             with self.db_lock:
@@ -558,9 +654,125 @@ class Phase2Receiver:
                 file_id=file_id,
                 file_md5='',
                 saved_path='',
+                sender_id=sender_id,
                 status='ERROR'
             )
             self.send_response(conn, error_response)
+    
+    def create_file_complete_packet(self, file_id: str, file_md5: str, saved_path: str, 
+                                  sender_id: str, status: str = 'OK') -> str:
+        """Create FILE_COMPLETE packet with sender info."""
+        lines = [
+            f"TYPE: FILE_COMPLETE",
+            f"FILE_ID: {file_id}",
+            f"SENDER_ID: {sender_id}",
+            f"FILE_MD5: {file_md5}",
+            f"STATUS: {status}",
+            f"SAVED_PATH: {saved_path}",
+            f"COMPLETED_AT: {datetime.now(timezone.utc).isoformat()}"
+        ]
+        
+        return '\n'.join(lines) + '\n'
+    
+    def schedule_reconstruction_if_needed(self, sender: SenderState):
+        """Schedule reconstruction for sender if conditions are met."""
+        if not sender.should_trigger_reconstruction():
+            return
+        
+        # Cancel existing timer for this sender
+        if sender.sender_id in self.reconstruction_timers:
+            self.reconstruction_timers[sender.sender_id].cancel()
+        
+        # Schedule new reconstruction with delay to batch multiple files
+        def trigger_reconstruction():
+            self.trigger_reconstruction(sender)
+        
+        timer = threading.Timer(self.args.reconstruction_delay, trigger_reconstruction)
+        timer.start()
+        self.reconstruction_timers[sender.sender_id] = timer
+        
+        self.logger.info(f"[{sender.sender_id}] Scheduled reconstruction in {self.args.reconstruction_delay}s "
+                        f"({len(sender.pending_objects)} pending objects)")
+    
+    def trigger_reconstruction(self, sender: SenderState):
+        """Trigger Phase 2 reconstruction for a specific sender."""
+        with sender.reconstruction_lock:
+            try:
+                if not sender.should_trigger_reconstruction():
+                    self.logger.debug(f"[{sender.sender_id}] Reconstruction conditions not met, skipping")
+                    return
+                
+                self.logger.info(f"[{sender.sender_id}] Triggering reconstruction for {len(sender.pending_objects)} new objects")
+                
+                # Prepare reconstruction arguments with proper boolean formatting
+                reconstruction_args = sender.get_reconstruction_args(debug_mode=self.args.debug_reconstruction)
+                
+                # Submit reconstruction task to thread pool
+                future = self.reconstruction_executor.submit(
+                    self.run_reconstruction_process, 
+                    sender.sender_id, 
+                    reconstruction_args
+                )
+                
+                # Clear pending objects
+                pending_count = len(sender.pending_objects)
+                sender.clear_pending_objects()
+                sender.last_reconstruction_time = time.time()
+                
+                # Update database
+                with self.db_lock:
+                    with sqlite3.connect(self.db_path) as db_conn:
+                        db_conn.execute('''
+                            UPDATE senders 
+                            SET last_reconstruction = CURRENT_TIMESTAMP
+                            WHERE sender_id = ?
+                        ''', (sender.sender_id,))
+                
+                self.logger.info(f"[{sender.sender_id}] Reconstruction task submitted ({pending_count} objects)")
+                
+            except Exception as e:
+                self.logger.error(f"[{sender.sender_id}] Error triggering reconstruction: {e}")
+    
+    def run_reconstruction_process(self, sender_id: str, args: List[str]) -> bool:
+        """Run the reconstruction process as a subprocess."""
+        try:
+            self.logger.info(f"[{sender_id}] Starting reconstruction subprocess")
+            self.logger.debug(f"[{sender_id}] Reconstruction command: {' '.join(args)}")
+            
+            # Start subprocess
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=os.getcwd()
+            )
+            
+            # Wait for completion with timeout
+            try:
+                stdout, stderr = process.communicate(timeout=self.args.reconstruction_timeout)
+                
+                if process.returncode == 0:
+                    self.logger.info(f"[{sender_id}] Reconstruction completed successfully")
+                    if stdout.strip():
+                        self.logger.debug(f"[{sender_id}] Reconstruction output: {stdout.strip()}")
+                    return True
+                else:
+                    self.logger.error(f"[{sender_id}] Reconstruction failed with return code {process.returncode}")
+                    if stderr.strip():
+                        self.logger.error(f"[{sender_id}] Reconstruction error: {stderr.strip()}")
+                    if stdout.strip():
+                        self.logger.error(f"[{sender_id}] Reconstruction stdout: {stdout.strip()}")
+                    return False
+                    
+            except subprocess.TimeoutExpired:
+                self.logger.error(f"[{sender_id}] Reconstruction timed out after {self.args.reconstruction_timeout}s")
+                process.kill()
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"[{sender_id}] Error running reconstruction process: {e}")
+            return False
     
     def cleanup_working_directory(self, work_dir: Path):
         """Clean up temporary working directory."""
@@ -580,7 +792,7 @@ class Phase2Receiver:
             self.logger.warning(f"Error cleaning up working directory {work_dir}: {e}")
     
     def handle_client_connection(self, conn: socket.socket, addr):
-        """Handle individual client connection."""
+        """Handle individual client connection with enhanced logging."""
         self.logger.info(f"New connection from {addr}")
         
         try:
@@ -591,6 +803,10 @@ class Phase2Receiver:
                     break
                 
                 packet_length = int.from_bytes(length_bytes, 'big')
+                
+                if packet_length > MAX_PACKET_SIZE * 4:  # Safety check
+                    self.logger.warning(f"Packet too large from {addr}: {packet_length} bytes")
+                    break
                 
                 # Receive packet data
                 packet_data = b''
@@ -610,6 +826,7 @@ class Phase2Receiver:
                     parsed = self.parse_packet(packet_text)
                     
                     packet_type = parsed['headers'].get('TYPE')
+                    sender_id = parsed['headers'].get('SENDER_ID', f'unknown_{addr[0]}')
                     
                     if packet_type == 'FILE_INIT':
                         self.handle_file_init(conn, parsed)
@@ -618,7 +835,7 @@ class Phase2Receiver:
                     elif packet_type == 'PART':
                         self.handle_part(conn, parsed)
                     else:
-                        self.logger.warning(f"Unknown packet type: {packet_type}")
+                        self.logger.warning(f"[{sender_id}] Unknown packet type: {packet_type}")
                         
                 except UnicodeDecodeError as e:
                     self.logger.error(f"Error decoding packet from {addr}: {e}")
@@ -636,72 +853,145 @@ class Phase2Receiver:
             self.logger.info(f"Connection closed from {addr}")
     
     def run_server(self):
-        """Run the TCP server."""
+        """Run the TCP server with connection pooling."""
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
-        try:
-            server_socket.bind((self.args.listen_host, self.args.listen_port))
-            server_socket.listen(self.args.max_connections)
-            
-            self.logger.info(f"Server listening on {self.args.listen_host}:{self.args.listen_port}")
-            
-            while self.running:
-                try:
-                    conn, addr = server_socket.accept()
-                    
-                    # Handle connection in separate thread
-                    client_thread = threading.Thread(
-                        target=self.handle_client_connection,
-                        args=(conn, addr),
-                        daemon=True
-                    )
-                    client_thread.start()
-                    
-                except socket.error as e:
-                    if self.running:
-                        self.logger.error(f"Socket error: {e}")
+        # Connection pool for handling multiple clients
+        with ThreadPoolExecutor(max_workers=self.args.max_connections) as executor:
+            try:
+                server_socket.bind((self.args.listen_host, self.args.listen_port))
+                server_socket.listen(self.args.max_connections)
+                
+                self.logger.info(f"Multi-Sender server listening on {self.args.listen_host}:{self.args.listen_port}")
+                self.logger.info(f"Ready to handle {self.args.max_connections} concurrent connections")
+                
+                while self.running:
+                    try:
+                        conn, addr = server_socket.accept()
                         
+                        # Submit connection to thread pool
+                        executor.submit(self.handle_client_connection, conn, addr)
+                        
+                    except socket.error as e:
+                        if self.running:
+                            self.logger.error(f"Socket error: {e}")
+                            
+            except Exception as e:
+                self.logger.error(f"Server error: {e}")
+            finally:
+                server_socket.close()
+    
+    def get_sender_statistics(self) -> Dict[str, Dict]:
+        """Get statistics for all senders."""
+        stats = {}
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    SELECT sender_id, first_seen, last_activity, files_received, 
+                           initial_scene_received, last_reconstruction
+                    FROM senders
+                ''')
+                
+                for row in cursor.fetchall():
+                    sender_id, first_seen, last_activity, files_received, scene_received, last_recon = row
+                    
+                    # Get pending objects count
+                    pending_count = 0
+                    if sender_id in self.senders:
+                        pending_count = len(self.senders[sender_id].pending_objects)
+                    
+                    stats[sender_id] = {
+                        'first_seen': first_seen,
+                        'last_activity': last_activity,
+                        'files_received': files_received,
+                        'initial_scene_received': bool(scene_received),
+                        'last_reconstruction': last_recon,
+                        'pending_objects': pending_count
+                    }
+        
         except Exception as e:
-            self.logger.error(f"Server error: {e}")
-        finally:
-            server_socket.close()
+            self.logger.error(f"Error getting sender statistics: {e}")
+        
+        return stats
+    
+    def print_status_report(self):
+        """Print status report for all senders."""
+        stats = self.get_sender_statistics()
+        
+        print("\n" + "="*60)
+        print("MULTI-SENDER RECEIVER STATUS")
+        print("="*60)
+        print(f"Active Senders: {len(stats)}")
+        print(f"Total Active Connections: {len([s for s in self.senders.values()])}")
+        print()
+        
+        for sender_id, sender_stats in stats.items():
+            print(f"Sender: {sender_id}")
+            print(f"  Files Received: {sender_stats['files_received']}")
+            print(f"  Scene Received: {sender_stats['initial_scene_received']}")
+            print(f"  Pending Objects: {sender_stats['pending_objects']}")
+            print(f"  Last Activity: {sender_stats['last_activity']}")
+            print(f"  Last Reconstruction: {sender_stats['last_reconstruction'] or 'Never'}")
+            print()
     
     def run(self):
-        """Run the receiver daemon."""
-        self.logger.info("Starting Phase 2 Receiver daemon")
+        """Run the multi-sender receiver daemon."""
+        self.logger.info("Starting Multi-Sender Phase 2 Receiver daemon")
+        
+        # Print initial status
+        self.print_status_report()
         
         try:
             self.run_server()
         except KeyboardInterrupt:
-            pass
+            self.logger.info("Received shutdown signal")
         finally:
             self.running = False
-            self.logger.info("Phase 2 Receiver daemon stopped")
+            
+            # Cancel all pending reconstruction timers
+            for timer in self.reconstruction_timers.values():
+                timer.cancel()
+            
+            # Shutdown reconstruction executor
+            self.reconstruction_executor.shutdown(wait=True)
+            
+            self.logger.info("Multi-Sender Phase 2 Receiver daemon stopped")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 2 Receiver - Receive anomaly detection data from Phase 1")
+    parser = argparse.ArgumentParser(description="Multi-Sender Phase 2 Receiver - Handle multiple anomaly detection senders")
     
     # Network options
     parser.add_argument('--listen-host', default='0.0.0.0',
                        help='Listen host address (default: 0.0.0.0)')
     parser.add_argument('--listen-port', type=int, default=5001,
                        help='Listen port (default: 5001)')
-    parser.add_argument('--max-connections', type=int, default=2,
-                       help='Maximum concurrent connections (default: 2)')
+    parser.add_argument('--max-connections', type=int, default=10,
+                       help='Maximum concurrent connections (default: 10)')
     
     # Directory options
-    parser.add_argument('--input-dir', default='captures',
-                       help='Input directory for Phase 2 (default: captures)')
+    parser.add_argument('--received-data-dir', default='received_data',
+                       help='Base directory for received data organized by sender (default: received_data)')
     parser.add_argument('--receive-queue', default='receive_queue',
                        help='Temporary receive queue directory (default: receive_queue)')
     
+    # Reconstruction options
+    parser.add_argument('--max-reconstruction-workers', type=int, default=3,
+                       help='Maximum concurrent reconstruction processes (default: 3)')
+    parser.add_argument('--reconstruction-delay', type=float, default=5.0,
+                       help='Delay before triggering reconstruction to batch files (default: 5.0s)')
+    parser.add_argument('--reconstruction-timeout', type=int, default=300,
+                       help='Reconstruction process timeout in seconds (default: 300)')
+    parser.add_argument('--debug-reconstruction', action='store_true',
+                       help='Enable debug mode for reconstruction processes')
+    
     # Storage options
-    parser.add_argument('--db-path', default='receiver.db',
-                       help='SQLite database path (default: receiver.db)')
-    parser.add_argument('--processed-json', default='output/processed_images.json',
-                       help='Processed images JSON file (default: output/processed_images.json)')
+    parser.add_argument('--db-path', default='multi_sender_receiver.db',
+                       help='SQLite database path (default: multi_sender_receiver.db)')
+    parser.add_argument('--processed-json', default='output/global_processed_images.json',
+                       help='Global processed images JSON file (default: output/global_processed_images.json)')
     parser.add_argument('--cleanup-temp', action='store_true',
                        help='Clean up temporary files after completion')
     
@@ -712,18 +1002,33 @@ def main():
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Log level (default: INFO)')
     
-    # Testing options
-    parser.add_argument('--test-mode', action='store_true',
-                       help='Enable test mode with simulated packet loss')
+    # Status reporting
+    parser.add_argument('--status-interval', type=int, default=300,
+                       help='Status report interval in seconds (default: 300, 0 to disable)')
     
     args = parser.parse_args()
     
     try:
-        receiver = Phase2Receiver(args)
+        receiver = MultiSenderPhase2Receiver(args)
+        
+        # Optional status reporting thread
+        if args.status_interval > 0:
+            def status_reporter():
+                while receiver.running:
+                    time.sleep(args.status_interval)
+                    if receiver.running:
+                        receiver.print_status_report()
+            
+            status_thread = threading.Thread(target=status_reporter, daemon=True)
+            status_thread.start()
+        
         receiver.run()
         return 0
+        
     except Exception as e:
         print(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
         return 1
 
 
