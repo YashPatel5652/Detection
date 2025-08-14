@@ -7,725 +7,1380 @@ from ultralytics import YOLO
 from collections import deque, defaultdict
 import math
 import hashlib
-import json
-from datetime import datetime
 import threading
-from queue import Queue
+import queue
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
+from functools import lru_cache
+import logging
+from pathlib import Path
+import signal
+import sys
+import json
 
-# Fixed argument parser
+# Setup argument parser
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, required=True, help='Path to YOLO model')
-parser.add_argument('-s', '--source', type=str, default='0', help='Video source')
-parser.add_argument('--save_dir', type=str, default='captures', help='Directory to save captures')
-parser.add_argument('--confidence', type=float, default=0.5, help='Detection confidence threshold')
-parser.add_argument('--iou_threshold', type=float, default=0.4, help='IoU threshold for NMS')
-parser.add_argument('--pi_mode', action='store_true', help='Enable Raspberry Pi optimizations')
-parser.add_argument('--depth_camera', action='store_true', help='Use depth camera if available')
-parser.add_argument('--scene_capture', action='store_true', help='Capture initial scene')
+parser.add_argument('--model', type=str, default='yolov8l.pt', help='Path to YOLOv8 model file')
+parser.add_argument('-s', '--source', type=str, default='0')
+parser.add_argument('--save_dir', type=str, default='captures')
+parser.add_argument('--confidence', type=float, default=0.60)
+parser.add_argument('--iou_threshold', type=float, default=0.4)
+parser.add_argument('--save-scene', action='store_false', help='Save initial scene for reference')
+parser.add_argument('--no-gui', action='store_true', help='Disable GUI for production')
+parser.add_argument('--detection-size', type=int, default=640, help='Detection resolution')
+parser.add_argument('--max-workers', type=int, default=2, help='Number of worker threads')
+parser.add_argument('--strict-tracking', action='store_true', help='Enable strict ID consistency mode')
+parser.add_argument('--buffer-size', type=int, default=15, help='Max images to buffer per object')
+parser.add_argument('--save-delay', type=int, default=30, help='Frames to wait after object disappears before saving')
+parser.add_argument('--min-total-frames', type=int, default=5, help='Minimum total frames for disappeared object to be saved')
+parser.add_argument('--periodic-save-interval', type=int, default=300, help='Frames interval for re-saving long-duration objects')
 args = parser.parse_args()
 
-class KalmanFilter:
-    """Simple Kalman filter for object position prediction"""
-    def __init__(self):
-        self.dt = 1.0  # Time step
-        self.A = np.array([[1, 0, self.dt, 0],
-                          [0, 1, 0, self.dt],
-                          [0, 0, 1, 0],
-                          [0, 0, 0, 1]], dtype=np.float32)  # State transition matrix
-        
-        self.H = np.array([[1, 0, 0, 0],
-                          [0, 1, 0, 0]], dtype=np.float32)  # Observation matrix
-        
-        self.Q = np.eye(4, dtype=np.float32) * 0.1  # Process noise
-        self.R = np.eye(2, dtype=np.float32) * 1.0  # Measurement noise
-        
-        self.x = np.zeros((4, 1), dtype=np.float32)  # State [x, y, vx, vy]
-        self.P = np.eye(4, dtype=np.float32) * 1000  # Error covariance
-        
-        self.initialized = False
-    
-    def predict(self):
-        if not self.initialized:
-            return None
-        
-        try:
-            self.x = np.dot(self.A, self.x)
-            self.P = np.dot(np.dot(self.A, self.P), self.A.T) + self.Q
-            return self.x[:2].flatten()
-        except Exception as e:
-            print(f"[KALMAN] Prediction error: {e}")
-            return None
-    
-    def update(self, measurement):
-        try:
-            measurement = np.array(measurement, dtype=np.float32).reshape(2, 1)
-            
-            if not self.initialized:
-                self.x[:2] = measurement
-                self.initialized = True
-                return
-            
-            y = measurement - np.dot(self.H, self.x)
-            S = np.dot(np.dot(self.H, self.P), self.H.T) + self.R
-            K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
-            
-            self.x = self.x + np.dot(K, y)
-            self.P = self.P - np.dot(np.dot(K, self.H), self.P)
-        except Exception as e:
-            print(f"[KALMAN] Update error: {e}")
+# Setup logging
+os.makedirs(args.save_dir, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(args.save_dir, 'detection.log')),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-class EnhancedObjectTracker:
-    def __init__(self, max_disappeared=30, movement_threshold=25, stationary_threshold=45, 
-                 min_stable_frames=3, depth_enabled=False):
+class ImageQualityAnalyzer:
+    """Lightweight image quality assessment for object crops"""
+    
+    def __init__(self):
+        # Quality weight parameters
+        self.sharpness_weight = 0.4
+        self.size_weight = 0.25
+        self.brightness_weight = 0.15
+        self.face_bonus_weight = 0.2
         
-        # Core tracking parameters
-        self.max_disappeared = max_disappeared
-        self.movement_threshold = movement_threshold
-        self.stationary_threshold = stationary_threshold
-        self.min_stable_frames = min_stable_frames
-        self.depth_enabled = depth_enabled
-        
-        # Object tracking data structures
-        self.objects = {}  # Active tracked objects
-        self.disappeared = {}  # Recently disappeared objects
-        self.ghost_objects = {}  # Objects for occlusion recovery
-        self.object_filters = {}  # Kalman filters for each object
-        
-        # Enhanced tracking features
-        self.object_movement_history = defaultdict(lambda: deque(maxlen=30))
-        self.object_capture_flags = {}  # Prevent redundant captures
-        self.object_initial_positions = {}  # Starting positions
-        self.object_stationary_counts = defaultdict(int)  # Stationary frame counts
-        self.object_areas = defaultdict(lambda: deque(maxlen=10))  # Area consistency tracking
-        self.object_depths = defaultdict(lambda: deque(maxlen=10)) if depth_enabled else None
-        
-        # Scene context and persistence buffer
-        self.scene_buffer = deque(maxlen=50)  # Optimized buffer size
-        self.spatial_grid = defaultdict(list)  # Spatial indexing for faster lookup
-        self.grid_size = 50  # Grid cell size in pixels
-        
-        # Timing and frame management
-        self.frame_count = 0
-        self.next_id = 0
-        self.last_cleanup = time.time()
-        self.cleanup_interval = 10  # Cleanup every 10 seconds
-        
-        # Quality and capture parameters
-        self.min_detection_area = 800 if args.pi_mode else 1200
-        self.min_bbox_size = 25 if args.pi_mode else 35
-        self.confidence_threshold = args.confidence
-        self.area_change_threshold = 0.3  # 30% area change tolerance
-        self.position_smoothing_factor = 0.7
-        
-        # Background subtractor for motion detection
+        # Face detection for person/animal priority
         try:
-            self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                detectShadows=True, varThreshold=50, history=200
+            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            self.face_detection_enabled = True
+            logger.info("Face detection enabled for quality assessment")
+        except:
+            self.face_detection_enabled = False
+            logger.warning("Face detection disabled - cascade not available")
+    
+    def calculate_sharpness(self, image):
+        """Calculate image sharpness using Laplacian variance"""
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            # Laplacian variance for sharpness
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            
+            # Normalize to 0-1 range (typical values: 0-2000)
+            normalized_sharpness = min(1.0, laplacian_var / 1000.0)
+            
+            return normalized_sharpness
+            
+        except Exception as e:
+            logger.debug(f"Sharpness calculation failed: {e}")
+            return 0.0
+    
+    def calculate_brightness_quality(self, image):
+        """Calculate brightness quality (avoid too dark/bright images)"""
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            mean_brightness = np.mean(gray)
+            
+            # Optimal brightness range: 80-180 (0-255 scale)
+            # Calculate quality based on distance from optimal range
+            if 80 <= mean_brightness <= 180:
+                quality = 1.0
+            elif mean_brightness < 80:
+                # Too dark
+                quality = max(0.0, mean_brightness / 80.0)
+            else:
+                # Too bright
+                quality = max(0.0, (255 - mean_brightness) / 75.0)
+            
+            return quality
+            
+        except Exception as e:
+            logger.debug(f"Brightness calculation failed: {e}")
+            return 0.5
+    
+    def detect_face_presence(self, image, object_label):
+        """Detect if image contains a visible face (for persons/animals)"""
+        if not self.face_detection_enabled:
+            return False
+        
+        # Only check for faces in person/animal objects
+        face_relevant_classes = ['person', 'human', 'man', 'woman', 'child', 'people']
+        if object_label.lower() not in face_relevant_classes:
+            return False
+        
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            # Detect faces
+            faces = self.face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=3, minSize=(20, 20)
             )
+            
+            return len(faces) > 0
+            
         except Exception as e:
-            print(f"[INIT] Background subtractor failed: {e}")
-            self.bg_subtractor = None
-        
-        # Scene capture setup
-        self.scene_captured = False
-        self.initial_scene = None
-        
-        print(f"[INIT] Enhanced tracker initialized with Pi-mode: {args.pi_mode}")
+            logger.debug(f"Face detection failed: {e}")
+            return False
     
-    def capture_initial_scene(self, frame):
-        """Capture the initial scene for reference"""
-        if not self.scene_captured and args.scene_capture:
-            try:
-                self.initial_scene = frame.copy()
-                scene_path = os.path.join(args.save_dir, f"initial_scene_{int(time.time())}.jpg")
-                cv2.imwrite(scene_path, self.initial_scene, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                self.scene_captured = True
-                print(f"[SCENE] Initial scene captured: {scene_path}")
-            except Exception as e:
-                print(f"[SCENE] Failed to capture initial scene: {e}")
-    
-    def get_spatial_grid_key(self, center):
-        """Get spatial grid key for efficient neighbor lookup"""
+    def calculate_size_quality(self, image, bbox_area):
+        """Calculate quality based on bounding box size"""
         try:
-            return (int(center[0]) // self.grid_size, int(center[1]) // self.grid_size)
-        except:
-            return (0, 0)
-    
-    def update_spatial_grid(self, obj_id, center, operation='add'):
-        """Update spatial indexing grid"""
-        try:
-            grid_key = self.get_spatial_grid_key(center)
+            # Larger objects generally provide better detail
+            # Normalize based on typical object sizes (1000-50000 pixels)
+            normalized_size = min(1.0, bbox_area / 25000.0)
             
-            if operation == 'add':
-                if obj_id not in self.spatial_grid[grid_key]:
-                    self.spatial_grid[grid_key].append(obj_id)
-            elif operation == 'remove':
-                if obj_id in self.spatial_grid[grid_key]:
-                    self.spatial_grid[grid_key].remove(obj_id)
-                    if not self.spatial_grid[grid_key]:
-                        del self.spatial_grid[grid_key]
+            # Bonus for very large objects
+            if bbox_area > 40000:
+                normalized_size = min(1.0, normalized_size * 1.1)
+            
+            return normalized_size
+            
         except Exception as e:
-            print(f"[GRID] Spatial grid update error: {e}")
+            logger.debug(f"Size quality calculation failed: {e}")
+            return 0.5
     
-    def find_nearby_objects(self, center, radius=100):
-        """Find objects near a given center using spatial indexing"""
-        nearby_objects = []
+    def calculate_overall_quality(self, image, bbox_area, object_label):
+        """Calculate comprehensive quality score"""
         try:
-            grid_key = self.get_spatial_grid_key(center)
+            # Individual quality metrics
+            sharpness = self.calculate_sharpness(image)
+            brightness = self.calculate_brightness_quality(image)
+            size_quality = self.calculate_size_quality(image, bbox_area)
             
-            # Check surrounding grid cells
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    check_key = (grid_key[0] + dx, grid_key[1] + dy)
-                    if check_key in self.spatial_grid:
-                        for obj_id in self.spatial_grid[check_key]:
-                            if obj_id in self.objects:
-                                obj_center = self.get_object_center(self.objects[obj_id][1])
-                                distance = self.calculate_distance(center, obj_center)
-                                if distance <= radius:
-                                    nearby_objects.append((obj_id, distance))
+            # Face detection bonus
+            face_bonus = 0.0
+            if self.detect_face_presence(image, object_label):
+                face_bonus = 1.0
+                logger.debug(f"Face detected in {object_label} - quality bonus applied")
+            
+            # Weighted combination
+            overall_score = (
+                sharpness * self.sharpness_weight +
+                size_quality * self.size_weight +
+                brightness * self.brightness_weight +
+                face_bonus * self.face_bonus_weight
+            )
+            
+            # Face bonus can exceed 1.0 for face-containing images
+            final_score = min(1.5 if face_bonus > 0 else 1.0, overall_score)
+            
+            return final_score, {
+                'sharpness': sharpness,
+                'brightness': brightness,
+                'size_quality': size_quality,
+                'face_detected': face_bonus > 0,
+                'bbox_area': bbox_area
+            }
+            
         except Exception as e:
-            print(f"[GRID] Nearby objects search error: {e}")
+            logger.error(f"Quality calculation failed: {e}")
+            return 0.0, {}
+
+class IntelligentImageBuffer:
+    """Enhanced buffer system with anomaly-aware saving for disappeared and long-duration objects"""
+    
+    def __init__(self, max_buffer_size=15, save_delay_frames=30, min_total_frames_for_disappeared=5, periodic_save_interval=300):
+        self.max_buffer_size = max_buffer_size
+        self.save_delay_frames = save_delay_frames
+        self.min_total_frames_for_disappeared = min_total_frames_for_disappeared  # NEW: Minimum frames for disappeared objects
+        self.periodic_save_interval = periodic_save_interval  # NEW: Periodic save interval for long-duration objects
         
-        return sorted(nearby_objects, key=lambda x: x[1])
+        # Object image buffers: {obj_id: [(image, quality_score, metadata, timestamp), ...]}
+        self.object_buffers = defaultdict(list)
+        
+        # Track when objects disappeared for delayed saving
+        self.disappeared_objects = {}  # {obj_id: frame_count_when_disappeared}
+        
+        # NEW: Track total frames seen per object (for disappeared object evaluation)
+        self.object_total_frames = defaultdict(int)
+        
+        # NEW: Track when objects were last saved (for periodic saving)
+        self.object_last_saved_frame = defaultdict(int)
+        
+        # NEW: Track objects that have been saved at least once
+        self.objects_ever_saved = set()
+        
+        # Quality analyzer
+        self.quality_analyzer = ImageQualityAnalyzer()
+        
+        # Statistics
+        self.total_images_buffered = 0
+        self.total_images_saved = 0
+        self.objects_processed = 0
+        self.disappeared_objects_saved = 0  # NEW: Count disappeared objects saved
+        self.periodic_saves = 0  # NEW: Count periodic saves
+        
+        logger.info(f"Enhanced intelligent image buffer initialized:")
+        logger.info(f"  - Buffer size: {max_buffer_size}")
+        logger.info(f"  - Save delay: {save_delay_frames} frames")
+        logger.info(f"  - Min total frames for disappeared objects: {min_total_frames_for_disappeared}")
+        logger.info(f"  - Periodic save interval: {periodic_save_interval} frames")
     
-    def calculate_distance(self, point1, point2):
-        """Calculate Euclidean distance between two points"""
+    def add_image(self, obj_id, image, bbox, confidence, object_label, frame_count):
+        """Add image to buffer with quality assessment and enhanced tracking"""
         try:
-            return math.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
-        except:
-            return float('inf')
+            # Calculate bbox area
+            x1, y1, x2, y2 = bbox
+            bbox_area = (x2 - x1) * (y2 - y1)
+            
+            # Calculate quality score
+            quality_score, quality_details = self.quality_analyzer.calculate_overall_quality(
+                image, bbox_area, object_label
+            )
+            
+            # NEW: Increment total frames seen for this object
+            self.object_total_frames[obj_id] += 1
+            
+            # Create metadata
+            metadata = {
+                'object_id': obj_id,
+                'label': object_label,
+                'bbox': bbox,
+                'confidence': confidence,
+                'frame_count': frame_count,
+                'quality_score': quality_score,
+                'quality_details': quality_details,
+                'timestamp': time.time(),
+                'total_frames_seen': self.object_total_frames[obj_id]  # NEW: Include total frames
+            }
+            
+            # Add to buffer
+            buffer_entry = (image.copy(), quality_score, metadata, time.time())
+            self.object_buffers[obj_id].append(buffer_entry)
+            self.total_images_buffered += 1
+            
+            # Maintain buffer size - keep only the best images
+            if len(self.object_buffers[obj_id]) > self.max_buffer_size:
+                # Sort by quality score and keep top images
+                self.object_buffers[obj_id].sort(key=lambda x: x[1], reverse=True)
+                self.object_buffers[obj_id] = self.object_buffers[obj_id][:self.max_buffer_size]
+            
+            # Remove from disappeared list if object reappeared
+            if obj_id in self.disappeared_objects:
+                del self.disappeared_objects[obj_id]
+            
+            logger.debug(f"Added image for object {obj_id} (quality: {quality_score:.3f}, buffer size: {len(self.object_buffers[obj_id])}, total frames: {self.object_total_frames[obj_id]})")
+            
+        except Exception as e:
+            logger.error(f"Failed to add image to buffer for object {obj_id}: {e}")
     
-    def calculate_iou(self, box1, box2):
-        """Calculate Intersection over Union"""
+    def mark_object_disappeared(self, obj_id, frame_count):
+        """Mark object as disappeared for delayed saving - FIXED VERSION"""
+        if obj_id in self.object_buffers and len(self.object_buffers[obj_id]) > 0:
+            # Only mark if not already marked to avoid overwriting the original disappeared frame
+            if obj_id not in self.disappeared_objects:
+                self.disappeared_objects[obj_id] = frame_count
+                logger.info(f"Object {obj_id} marked as disappeared at frame {frame_count} (total frames seen: {self.object_total_frames[obj_id]})")
+            else:
+                logger.debug(f"Object {obj_id} already marked as disappeared at frame {self.disappeared_objects[obj_id]}")
+
+    def get_objects_ready_for_saving(self, current_frame_count):
+        """DEBUGGING VERSION - Enhanced method with detailed logging"""
+        ready_objects = []
+        
+        # 1. Handle disappeared objects
+        for obj_id, disappeared_frame in list(self.disappeared_objects.items()):
+            frames_since_disappeared = current_frame_count - disappeared_frame
+            
+            # DEBUG: Log the calculation
+            logger.debug(f"Checking disappeared object {obj_id}: "
+                        f"current_frame={current_frame_count}, "
+                        f"disappeared_frame={disappeared_frame}, "
+                        f"frames_since_disappeared={frames_since_disappeared}, "
+                        f"save_delay_frames={self.save_delay_frames}")
+            
+            if frames_since_disappeared >= self.save_delay_frames:
+                ready_objects.append((obj_id, 'disappeared'))
+                logger.info(f"Object {obj_id} ready for disappeared save (waited {frames_since_disappeared} frames)")
+        
+        # 2. Handle periodic saving for long-duration objects
+        for obj_id in list(self.object_buffers.keys()):
+            if obj_id in self.disappeared_objects:
+                continue
+                
+            if self._should_periodic_save(obj_id, current_frame_count):
+                ready_objects.append((obj_id, 'periodic'))
+                logger.debug(f"Object {obj_id} ready for periodic save")
+        
+        return ready_objects
+    
+    def _should_periodic_save(self, obj_id, current_frame_count):
+        """NEW: Determine if object should be periodically saved"""
+        # Must have been seen for minimum total frames
+        if self.object_total_frames[obj_id] < self.min_total_frames_for_disappeared:
+            return False
+        
+        # Check if enough frames have passed since last save
+        last_saved_frame = self.object_last_saved_frame.get(obj_id, 0)
+        frames_since_last_save = current_frame_count - last_saved_frame
+        
+        # For objects never saved, use a shorter initial interval
+        if obj_id not in self.objects_ever_saved:
+            initial_save_threshold = max(self.periodic_save_interval // 3, 50)  # 1/3 of periodic interval, min 50 frames
+            return frames_since_last_save >= initial_save_threshold
+        
+        # For objects already saved, use full periodic interval
+        return frames_since_last_save >= self.periodic_save_interval
+    
+    def get_best_image(self, obj_id):
+        """Get the best quality image for an object"""
+        if obj_id not in self.object_buffers or len(self.object_buffers[obj_id]) == 0:
+            return None
+        
+        # Sort by quality score and get the best one
+        buffer = self.object_buffers[obj_id]
+        buffer.sort(key=lambda x: x[1], reverse=True)
+        
+        best_image, best_score, best_metadata, _ = buffer[0]
+        
+        logger.info(f"Selected best image for object {obj_id}: quality {best_score:.3f} from {len(buffer)} candidates")
+        
+        return best_image, best_metadata
+    
+    def save_and_cleanup_object(self, obj_id, save_reason, image_saver):
+        """Enhanced method to save best image with reason-specific handling"""
         try:
-            x1 = max(box1[0], box2[0])
-            y1 = max(box1[1], box2[1])
-            x2 = min(box1[2], box2[2])
-            y2 = min(box1[3], box2[3])
+            best_result = self.get_best_image(obj_id)
+            if best_result is None:
+                logger.warning(f"No images available for object {obj_id}")
+                return False
             
-            if x2 <= x1 or y2 <= y1:
-                return 0.0
+            best_image, metadata = best_result
             
-            intersection = (x2 - x1) * (y2 - y1)
-            area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-            area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-            union = area1 + area2 - intersection
+            # NEW: Enhanced logic based on save reason
+            should_save = False
+            cleanup_buffer = False
             
-            return intersection / union if union > 0 else 0.0
+            if save_reason == 'disappeared':
+                # For disappeared objects, check minimum total frames requirement
+                total_frames = self.object_total_frames.get(obj_id, 0)
+                if total_frames >= self.min_total_frames_for_disappeared:
+                    should_save = True
+                    cleanup_buffer = True  # Full cleanup for disappeared objects
+                    self.disappeared_objects_saved += 1
+                    logger.info(f"Saving disappeared object {obj_id} (total frames: {total_frames})")
+                else:
+                    logger.info(f"Skipping disappeared object {obj_id} - insufficient frames ({total_frames}/{self.min_total_frames_for_disappeared})")
+                    cleanup_buffer = True  # Still cleanup buffer even if not saving
+                    
+            elif save_reason == 'periodic':
+                should_save = True
+                cleanup_buffer = False  # Keep buffer for future periodic saves, but reset it
+                self.periodic_saves += 1
+                logger.info(f"Periodic save for long-duration object {obj_id}")
+            
+            else:
+                # Original logic for standard saves
+                should_save = True
+                cleanup_buffer = True
+            
+            if should_save:
+                # Generate filename with timestamp and save reason
+                timestamp = int(time.time() * 1000)
+                save_suffix = f"_{save_reason}" if save_reason in ['disappeared', 'periodic'] else ""
+                filename = f"{metadata['label']}_ID{obj_id}_{timestamp}{save_suffix}.jpg"
+                
+                # Add save reason to metadata
+                metadata['save_reason'] = save_reason
+                metadata['total_frames_when_saved'] = self.object_total_frames.get(obj_id, 0)
+                
+                # Save image
+                success = image_saver.save_best_image(best_image, filename, metadata)
+                
+                if success:
+                    self.total_images_saved += 1
+                    if cleanup_buffer:
+                        self.objects_processed += 1
+                    
+                    # NEW: Update tracking for periodic saves
+                    if save_reason == 'periodic':
+                        self.object_last_saved_frame[obj_id] = metadata['frame_count']
+                        self.objects_ever_saved.add(obj_id)
+                        # Reset buffer for periodic saves to capture new frames
+                        self.object_buffers[obj_id] = []
+                        logger.info(f"Buffer reset for object {obj_id} after periodic save")
+                    
+                    # Cleanup based on save reason
+                    if cleanup_buffer:
+                        self.cleanup_object_buffer(obj_id)
+                    
+                    logger.info(f"SAVED BEST IMAGE: {filename} (quality: {metadata['quality_score']:.3f}, reason: {save_reason})")
+                    return True
+                else:
+                    logger.error(f"Failed to save best image for object {obj_id}")
+                    return False
+            else:
+                # Cleanup even if not saving
+                if cleanup_buffer:
+                    self.cleanup_object_buffer(obj_id)
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error saving best image for object {obj_id}: {e}")
+            return False
+    
+    def cleanup_object_buffer(self, obj_id):
+        """Remove object from all buffers and tracking"""
+        if obj_id in self.object_buffers:
+            del self.object_buffers[obj_id]
+        
+        if obj_id in self.disappeared_objects:
+            del self.disappeared_objects[obj_id]
+        
+        # NEW: Clean up enhanced tracking data
+        if obj_id in self.object_total_frames:
+            del self.object_total_frames[obj_id]
+        
+        if obj_id in self.object_last_saved_frame:
+            del self.object_last_saved_frame[obj_id]
+        
+        self.objects_ever_saved.discard(obj_id)
+    
+    def get_buffer_stats(self):
+        """Get enhanced buffer statistics"""
+        total_buffered_images = sum(len(buffer) for buffer in self.object_buffers.values())
+        
+        return {
+            'active_object_buffers': len(self.object_buffers),
+            'total_buffered_images': total_buffered_images,
+            'disappeared_objects': len(self.disappeared_objects),
+            'total_images_buffered': self.total_images_buffered,
+            'total_images_saved': self.total_images_saved,
+            'objects_processed': self.objects_processed,
+            'disappeared_objects_saved': self.disappeared_objects_saved,  # NEW
+            'periodic_saves': self.periodic_saves,  # NEW
+            'objects_ever_saved': len(self.objects_ever_saved),  # NEW
+            'objects_ready_for_periodic_save': sum(1 for obj_id in self.object_buffers.keys() 
+                                                 if obj_id not in self.disappeared_objects and 
+                                                 self._should_periodic_save_stats(obj_id))  # NEW
+        }
+    
+    def _should_periodic_save_stats(self, obj_id):
+        """Helper method for statistics - check if object is close to periodic save threshold"""
+        if self.object_total_frames[obj_id] < self.min_total_frames_for_disappeared:
+            return False
+        
+        last_saved_frame = self.object_last_saved_frame.get(obj_id, 0)
+        current_frame = max(metadata['frame_count'] for _, _, metadata, _ in self.object_buffers[obj_id]) if self.object_buffers[obj_id] else 0
+        frames_since_last_save = current_frame - last_saved_frame
+        
+        threshold = max(self.periodic_save_interval // 3, 50) if obj_id not in self.objects_ever_saved else self.periodic_save_interval
+        return frames_since_last_save >= (threshold * 0.8)  # 80% of threshold
+    
+    def cleanup_old_buffers(self, max_age_seconds=300):
+        """Cleanup very old buffers to prevent memory issues"""
+        current_time = time.time()
+        cleanup_objects = []
+        
+        for obj_id, buffer in self.object_buffers.items():
+            if buffer:
+                oldest_timestamp = min(entry[3] for entry in buffer)
+                if current_time - oldest_timestamp > max_age_seconds:
+                    cleanup_objects.append(obj_id)
+        
+        for obj_id in cleanup_objects:
+            logger.info(f"Cleaning up old buffer for object {obj_id}")
+            self.cleanup_object_buffer(obj_id)
+    
+    def debug_disappeared_objects(self, current_frame_count):
+        """Debug method to check disappeared objects status"""
+        if self.disappeared_objects:
+            logger.info("=== DISAPPEARED OBJECTS DEBUG ===")
+            for obj_id, disappeared_frame in self.disappeared_objects.items():
+                frames_since_disappeared = current_frame_count - disappeared_frame
+                total_frames = self.object_total_frames.get(obj_id, 0)
+                buffer_size = len(self.object_buffers.get(obj_id, []))
+                
+                logger.info(f"Object {obj_id}: disappeared_frame={disappeared_frame}, "
+                          f"frames_since={frames_since_disappeared}, "
+                          f"total_frames={total_frames}, "
+                          f"buffer_size={buffer_size}, "
+                          f"ready={frames_since_disappeared >= self.save_delay_frames}")
+            logger.info("===================================")
+
+class RobustObjectTracker:
+    """Enhanced tracker with strict ID consistency for static scenes"""
+    
+    def __init__(self, max_disappeared=60, strict_mode=False):
+        # Core parameters - much more conservative for static scenes
+        self.max_disappeared = max_disappeared
+        self.strict_mode = strict_mode
+        
+        # Main tracking structures
+        self.objects = {}  # Active objects: {id: (label, bbox, conf, timestamp, features)}
+        self.disappeared = {}  # Track disappeared frames
+        self.object_memory = {}  # Long-term memory for static objects
+        self.next_id = 0
+        
+        # Advanced features for ID consistency
+        self.object_features = {}  # Store visual features for each object
+        self.object_positions = defaultdict(list)  # Position history
+        self.object_sizes = defaultdict(list)  # Size history  
+        self.stable_objects = set()  # Objects confirmed as static
+        self.occlusion_memory = {}  # Remember objects during occlusion
+        
+        # Matching thresholds - tuned for static scene consistency
+        self.position_threshold = 90  # Pixels - more lenient for edge cases
+        self.size_tolerance = 0.50  # 40% size variation allowed
+        self.iou_threshold = 0.25  # Lower IoU threshold for partial overlaps
+        self.feature_similarity_threshold = 0.50  # Feature matching threshold
+        
+        # Static object detection
+        self.static_detection_frames = 4  # Frames to confirm static
+        self.position_variance_threshold = 30  # Low variance = static object
+        
+        # Occlusion handling
+        self.occlusion_timeout = 50  # Remember occluded objects for 150 frames
+        self.partial_visibility_threshold = 0.4  # 30% visible = still trackable
+        
+        # MODIFIED: Simplified save management - delegate to IntelligentImageBuffer
+        self.object_consecutive_frames = defaultdict(int)  # Track consecutive detections
+        self.min_consecutive_frames = 3  # Minimum frames before buffering (reduced since we now buffer)
+        
+        # Performance tracking
+        self.frame_count = 0
+        self.total_objects_created = 0
+        self.id_switches = 0
+        
+        logger.info(f"Robust tracker initialized - Strict mode: {strict_mode}, Min consecutive frames for buffering: {self.min_consecutive_frames}")
+    
+    def extract_visual_features(self, image_crop):
+        """Extract simple but effective visual features from object crop"""
+        try:
+            if image_crop.size == 0:
+                return None
+                
+            # Resize to standard size for consistent feature extraction
+            crop_resized = cv2.resize(image_crop, (64, 64))
+            
+            # Color histogram features
+            hist_b = cv2.calcHist([crop_resized], [0], None, [16], [0, 256])
+            hist_g = cv2.calcHist([crop_resized], [1], None, [16], [0, 256])
+            hist_r = cv2.calcHist([crop_resized], [2], None, [16], [0, 256])
+            
+            # Edge features
+            gray = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_ratio = np.sum(edges > 0) / (64 * 64)
+            
+            # Combine features
+            features = np.concatenate([
+                hist_b.flatten(),
+                hist_g.flatten(), 
+                hist_r.flatten(),
+                [edge_ratio]
+            ])
+            
+            # Normalize
+            features = features / (np.linalg.norm(features) + 1e-8)
+            return features
+            
+        except Exception as e:
+            logger.error(f"Feature extraction failed: {e}")
+            return None
+    
+    def calculate_feature_similarity(self, features1, features2):
+        """Calculate similarity between visual features"""
+        if features1 is None or features2 is None:
+            return 0.0
+        
+        try:
+            # Cosine similarity
+            dot_product = np.dot(features1, features2)
+            return max(0.0, dot_product)  # Clamp to [0, 1]
         except:
             return 0.0
     
     def get_object_center(self, bbox):
         """Get center point of bounding box"""
-        try:
-            return ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
-        except:
-            return (0, 0)
+        return ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
     
     def get_bbox_area(self, bbox):
         """Calculate bounding box area"""
-        try:
-            return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-        except:
-            return 0
+        return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
     
-    def is_motion_detected(self, frame, bbox):
-        """Verify motion using background subtraction"""
-        if self.bg_subtractor is None:
-            return True  # Default to motion detected if no background subtractor
+    def calculate_distance(self, point1, point2):
+        """Calculate Euclidean distance"""
+        return math.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
+    
+    def calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
         
-        try:
-            x1, y1, x2, y2 = bbox
-            # Ensure coordinates are within frame bounds
-            h, w = frame.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-            
-            if x2 <= x1 or y2 <= y1:
-                return True
-            
-            roi = frame[y1:y2, x1:x2]
-            if roi.size == 0:
-                return True
-            
-            fg_mask = self.bg_subtractor.apply(roi)
-            motion_pixels = cv2.countNonZero(fg_mask)
-            total_pixels = roi.shape[0] * roi.shape[1]
-            motion_ratio = motion_pixels / total_pixels if total_pixels > 0 else 0
-            return motion_ratio > 0.1  # 10% motion threshold
-        except Exception as e:
-            print(f"[MOTION] Motion detection error: {e}")
-            return True  # Default to motion detected if error
-    
-    def calculate_total_movement(self, obj_id, current_center):
-        """Calculate total movement distance for an object"""
-        try:
-            if obj_id not in self.object_initial_positions:
-                self.object_initial_positions[obj_id] = current_center
-                return 0.0
-            
-            # Add current position to history
-            self.object_movement_history[obj_id].append(current_center)
-            
-            # Calculate total distance from initial position
-            initial_pos = self.object_initial_positions[obj_id]
-            total_distance = self.calculate_distance(initial_pos, current_center)
-            
-            return total_distance
-        except Exception as e:
-            print(f"[MOVEMENT] Movement calculation error: {e}")
+        if x2 <= x1 or y2 <= y1:
             return 0.0
+            
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
     
-    def should_capture_object(self, obj_id, current_center, bbox, frame):
-        """Determine if object should be captured based on movement and other criteria"""
-        try:
-            # Check if already captured
-            if self.object_capture_flags.get(obj_id, False):
-                total_movement = self.calculate_total_movement(obj_id, current_center)
-                
-                # Re-capture if significant movement from last capture position
-                if total_movement > self.movement_threshold * 2:
-                    self.object_capture_flags[obj_id] = False  # Reset for re-capture
-                    return True
-                return False
-            
-            # Calculate movement since initial detection
-            total_movement = self.calculate_total_movement(obj_id, current_center)
-            
-            # Check stationary duration
-            if total_movement < self.movement_threshold:
-                self.object_stationary_counts[obj_id] += 1
-                if self.object_stationary_counts[obj_id] > self.stationary_threshold:
-                    return False  # Too stationary, don't capture
-            else:
-                self.object_stationary_counts[obj_id] = 0  # Reset stationary count
-            
-            # Verify motion using background subtraction
-            if not self.is_motion_detected(frame, bbox):
-                return False
-            
-            # Check if minimum movement threshold is met
-            if total_movement >= self.movement_threshold:
-                return True
-            
+    def is_object_static(self, obj_id):
+        """Determine if object is static based on position history"""
+        if obj_id not in self.object_positions:
             return False
-        except Exception as e:
-            print(f"[CAPTURE] Capture decision error: {e}")
+            
+        positions = self.object_positions[obj_id]
+        if len(positions) < self.static_detection_frames:
             return False
+        
+        # Calculate position variance
+        recent_positions = positions[-self.static_detection_frames:]
+        if len(recent_positions) < 2:
+            return False
+            
+        x_coords = [pos[0] for pos in recent_positions]
+        y_coords = [pos[1] for pos in recent_positions]
+        
+        x_var = np.var(x_coords)
+        y_var = np.var(y_coords)
+        
+        # Low variance indicates static object
+        is_static = (x_var + y_var) < self.position_variance_threshold
+        
+        if is_static and obj_id not in self.stable_objects:
+            self.stable_objects.add(obj_id)
+            logger.info(f"Object {obj_id} confirmed as static")
+        
+        return is_static
     
-    def area_consistency_check(self, obj_id, current_area):
-        """Check if object area is consistent over time"""
-        try:
-            self.object_areas[obj_id].append(current_area)
-            
-            if len(self.object_areas[obj_id]) < 3:
-                return True  # Not enough data
-            
-            areas = list(self.object_areas[obj_id])
-            avg_area = sum(areas) / len(areas)
-            
-            # Check if current area is within acceptable range
-            if avg_area == 0:
-                return True
-            
-            area_change = abs(current_area - avg_area) / avg_area
-            return area_change < self.area_change_threshold
-        except Exception as e:
-            print(f"[AREA] Area consistency check error: {e}")
-            return True
+    def calculate_overlap_ratio(self, box1, box2):
+        """Calculate how much box1 overlaps with box2"""
+        intersection_area = self.calculate_iou(box1, box2) * min(
+            self.get_bbox_area(box1), self.get_bbox_area(box2)
+        )
+        box1_area = self.get_bbox_area(box1)
+        
+        return intersection_area / box1_area if box1_area > 0 else 0.0
     
-    def match_detection_to_object(self, detection, obj_data):
-        """Enhanced object matching with multiple criteria"""
-        try:
-            det_label, det_bbox, det_conf = detection
-            
-            # Fixed: Handle the object data format correctly
-            if len(obj_data) == 4:
-                obj_label, obj_bbox, obj_conf, obj_timestamp = obj_data
-            else:
-                return 0.0
-            
-            if det_label != obj_label:
-                return 0.0
-            
-            # Calculate various similarity metrics
-            iou_score = self.calculate_iou(det_bbox, obj_bbox)
-            
-            det_center = self.get_object_center(det_bbox)
-            obj_center = self.get_object_center(obj_bbox)
-            distance = self.calculate_distance(det_center, obj_center)
-            
-            det_area = self.get_bbox_area(det_bbox)
-            obj_area = self.get_bbox_area(obj_bbox)
-            
-            if max(det_area, obj_area) == 0:
-                return 0.0
-            
+    def match_detection_to_object(self, detection, obj_data, frame_crop=None):
+        """Enhanced matching with multiple criteria for better ID consistency"""
+        det_label, det_bbox, det_conf = detection
+        obj_label, obj_bbox, obj_conf, obj_timestamp = obj_data[:4]
+        
+        # Same class requirement
+        if det_label != obj_label:
+            return 0.0
+        
+        # Multi-criteria scoring
+        scores = {}
+        
+        # 1. Position similarity
+        det_center = self.get_object_center(det_bbox)
+        obj_center = self.get_object_center(obj_bbox)
+        distance = self.calculate_distance(det_center, obj_center)
+        scores['position'] = max(0, 1 - (distance / self.position_threshold))
+        
+        # 2. Size similarity  
+        det_area = self.get_bbox_area(det_bbox)
+        obj_area = self.get_bbox_area(obj_bbox)
+        if max(det_area, obj_area) > 0:
             size_ratio = min(det_area, obj_area) / max(det_area, obj_area)
-            conf_similarity = 1.0 - abs(det_conf - obj_conf)
+            scores['size'] = size_ratio if size_ratio >= self.size_tolerance else 0
+        else:
+            scores['size'] = 0
+        
+        # 3. IoU similarity
+        iou = self.calculate_iou(det_bbox, obj_bbox)
+        scores['iou'] = iou
+        
+        # 4. Visual feature similarity (if available)
+        if frame_crop is not None and len(obj_data) > 4:
+            det_features = self.extract_visual_features(frame_crop)
+            obj_features = obj_data[4] if len(obj_data) > 4 else None
             
-            # Multi-criteria scoring
-            if distance > 100 or size_ratio < 0.3 or iou_score < 0.1:
-                return 0.0
-            
-            distance_score = max(0, 1.0 - (distance / 80.0))
-            
+            if det_features is not None and obj_features is not None:
+                feature_sim = self.calculate_feature_similarity(det_features, obj_features)
+                scores['features'] = feature_sim
+            else:
+                scores['features'] = 0.5  # Neutral if features unavailable
+        else:
+            scores['features'] = 0.5
+        
+        # 5. Static object bonus
+        obj_id = next((k for k, v in self.objects.items() if v == obj_data), None)
+        if obj_id is not None and obj_id in self.stable_objects:
+            scores['static_bonus'] = 1.2  # 20% bonus for static objects
+        else:
+            scores['static_bonus'] = 1.0
+        
+        # Weighted combination - emphasize position and features for static scenes
+        if self.strict_mode:
+            # Strict mode: Higher weight on features and position consistency
             total_score = (
-                iou_score * 0.3 +
-                distance_score * 0.4 +
-                size_ratio * 0.2 +
-                conf_similarity * 0.1
-            )
-            
-            return total_score
-        except Exception as e:
-            print(f"[MATCH] Object matching error: {e}")
+                scores['position'] * 0.3 +
+                scores['size'] * 0.2 +
+                scores['iou'] * 0.2 +
+                scores['features'] * 0.3
+            ) * scores['static_bonus']
+        else:
+            # Standard mode: Balanced scoring
+            total_score = (
+                scores['position'] * 0.25 +
+                scores['size'] * 0.25 +
+                scores['iou'] * 0.25 +
+                scores['features'] * 0.25
+            ) * scores['static_bonus']
+        
+        # Minimum thresholds for matching
+        if scores['position'] < 0.3 and scores['iou'] < self.iou_threshold:
             return 0.0
+        
+        return min(1.0, total_score)  # Clamp to [0, 1]
     
-    def update(self, detections, frame=None):
-        """Main tracking update with enhanced features"""
-        try:
-            current_time = time.time()
-            self.frame_count += 1
-            
-            # Capture initial scene
-            if frame is not None:
-                self.capture_initial_scene(frame)
-            
-            # Handle empty detections
-            if not detections:
-                self._handle_no_detections()
-                return self.objects, set()
-            
-            # Filter valid detections
-            valid_detections = self._filter_detections(detections, frame)
-            
-            if not valid_detections:
-                self._handle_no_detections()
-                return self.objects, set()
-            
-            # Match detections with existing objects
-            matched_objects = {}
-            objects_to_save = set()
-            unmatched_detections = list(range(len(valid_detections)))
-            
-            # Enhanced matching with Kalman filtering
-            for obj_id, obj_data in self.objects.items():
-                best_match_idx = None
-                best_score = 0.3  # Minimum matching threshold
+    def handle_occlusion_recovery(self, unmatched_detections, frame):
+        """Attempt to recover objects from occlusion memory"""
+        recovered_matches = {}
+        
+        for det_idx, detection in enumerate(unmatched_detections):
+            if det_idx in recovered_matches:
+                continue
                 
-                for i, detection in enumerate(valid_detections):
-                    if i not in unmatched_detections:
-                        continue
+            det_label, det_bbox, det_conf = detection
+            det_center = self.get_object_center(det_bbox)
+            
+            best_match_id = None
+            best_score = 0.4  # Higher threshold for occlusion recovery
+            
+            # Check occlusion memory for potential matches
+            for obj_id, (mem_label, mem_bbox, mem_features, mem_timestamp) in self.occlusion_memory.items():
+                if det_label != mem_label:
+                    continue
+                
+                # Skip if too much time has passed
+                if self.frame_count - mem_timestamp > self.occlusion_timeout:
+                    continue
+                
+                # Position-based matching for occluded objects
+                mem_center = self.get_object_center(mem_bbox)
+                distance = self.calculate_distance(det_center, mem_center)
+                
+                if distance < self.position_threshold * 1.5:  # More lenient for occlusion
+                    # Try feature matching if available
+                    score = 0.5  # Base score
                     
-                    score = self.match_detection_to_object(detection, obj_data)
+                    if mem_features is not None:
+                        try:
+                            x1, y1, x2, y2 = det_bbox
+                            crop = frame[y1:y2, x1:x2]
+                            det_features = self.extract_visual_features(crop)
+                            
+                            if det_features is not None:
+                                feature_sim = self.calculate_feature_similarity(det_features, mem_features)
+                                score = feature_sim
+                        except:
+                            pass
                     
                     if score > best_score:
                         best_score = score
-                        best_match_idx = i
-                
-                if best_match_idx is not None:
-                    detection = valid_detections[best_match_idx]
-                    label, bbox, conf = detection
-                    
-                    # Update Kalman filter
-                    center = self.get_object_center(bbox)
-                    if obj_id not in self.object_filters:
-                        self.object_filters[obj_id] = KalmanFilter()
-                    self.object_filters[obj_id].update(center)
-                    
-                    # Update object data
-                    matched_objects[obj_id] = (label, bbox, conf, current_time)
-                    unmatched_detections.remove(best_match_idx)
-                    
-                    # Update spatial grid
-                    self.update_spatial_grid(obj_id, center, 'add')
-                    
-                    # Check if should capture
-                    if frame is not None and self.should_capture_object(obj_id, center, bbox, frame):
-                        # Perform area consistency check
-                        current_area = self.get_bbox_area(bbox)
-                        if self.area_consistency_check(obj_id, current_area):
-                            objects_to_save.add(obj_id)
-                            self.object_capture_flags[obj_id] = True
-                    
-                    # Remove from disappeared
-                    self.disappeared.pop(obj_id, None)
+                        best_match_id = obj_id
             
-            # Create new objects from unmatched detections
-            for i in unmatched_detections:
-                detection = valid_detections[i]
-                label, bbox, conf = detection
-                center = self.get_object_center(bbox)
-                
-                # Check for nearby existing objects to avoid duplicates
-                nearby_objects = self.find_nearby_objects(center, radius=50)
-                if not nearby_objects:  # No nearby objects, create new
-                    new_obj_id = self.next_id
-                    self.next_id += 1
-                    
-                    matched_objects[new_obj_id] = (label, bbox, conf, current_time)
-                    
-                    # Initialize Kalman filter
-                    self.object_filters[new_obj_id] = KalmanFilter()
-                    self.object_filters[new_obj_id].update(center)
-                    
-                    # Update spatial grid
-                    self.update_spatial_grid(new_obj_id, center, 'add')
-                    
-                    # Check initial capture criteria
-                    if frame is not None:
-                        current_area = self.get_bbox_area(bbox)
-                        self.area_consistency_check(new_obj_id, current_area)
-                        
-                        # Always capture new objects that meet criteria
-                        if (current_area >= self.min_detection_area and 
-                            self.is_motion_detected(frame, bbox)):
-                            objects_to_save.add(new_obj_id)
-                            self.object_capture_flags[new_obj_id] = True
-            
-            # Handle disappeared objects
-            self._update_disappeared_objects(matched_objects)
-            
-            # Periodic cleanup
-            if current_time - self.last_cleanup > self.cleanup_interval:
-                self._cleanup_old_data()
-                self.last_cleanup = current_time
-            
-            # Update main objects dictionary
-            self.objects = matched_objects
-            
-            return self.objects, objects_to_save
-            
-        except Exception as e:
-            print(f"[UPDATE] Tracker update error: {e}")
-            return self.objects, set()
+            if best_match_id is not None:
+                recovered_matches[det_idx] = best_match_id
+                logger.info(f"Recovered object {best_match_id} from occlusion (score: {best_score:.2f})")
+        
+        return recovered_matches
     
-    def _filter_detections(self, detections, frame):
-        """Filter and validate detections"""
+    def update(self, detections, frame=None):
+        """Main tracking update with enhanced ID consistency"""
+        self.frame_count += 1
+        current_time = time.time()
+        
+        if not detections:
+            self._handle_no_detections()
+            return self.objects, set()
+        
+        # Filter valid detections
         valid_detections = []
+        for det in detections:
+            label, bbox, conf = det
+            area = self.get_bbox_area(bbox)
+            if area >= 1000 and conf >= args.confidence:  # Minimum size filter
+                valid_detections.append(det)
         
-        for detection in detections:
-            try:
-                label, bbox, conf = detection
-                area = self.get_bbox_area(bbox)
-                bbox_w = bbox[2] - bbox[0]
-                bbox_h = bbox[3] - bbox[1]
+        if not valid_detections:
+            self._handle_no_detections()
+            return self.objects, set()
+        
+        # Matching phase
+        matched_objects = {}
+        objects_for_buffering = set()  # MODIFIED: Changed from objects_to_save
+        unmatched_detections = list(range(len(valid_detections)))
+        
+        # Match with existing objects using enhanced criteria
+        for obj_id, obj_data in self.objects.items():
+            best_match_idx = None
+            best_score = 0.55 if self.strict_mode else 0.35  # Higher threshold in strict mode
+            
+            for i, detection in enumerate(valid_detections):
+                if i not in unmatched_detections:
+                    continue
                 
-                # Size and confidence checks
-                if (area >= self.min_detection_area and 
-                    conf >= self.confidence_threshold and
-                    bbox_w >= self.min_bbox_size and 
-                    bbox_h >= self.min_bbox_size):
-                    
-                    # Additional motion verification if frame available
-                    if frame is None or self.is_motion_detected(frame, bbox):
-                        valid_detections.append(detection)
-                        
-            except Exception as e:
-                print(f"[FILTER] Detection filtering failed: {e}")
-                continue
+                # Extract crop for feature matching
+                crop = None
+                if frame is not None:
+                    try:
+                        x1, y1, x2, y2 = detection[1]
+                        crop = frame[y1:y2, x1:x2]
+                    except:
+                        pass
+                
+                score = self.match_detection_to_object(detection, obj_data, crop)
+                
+                if score > best_score:
+                    best_score = score
+                    best_match_idx = i
+            
+            if best_match_idx is not None:
+                detection = valid_detections[best_match_idx]
+                label, bbox, conf = detection
+                
+                # Extract and store features
+                features = None
+                if frame is not None:
+                    try:
+                        x1, y1, x2, y2 = bbox
+                        crop = frame[y1:y2, x1:x2]
+                        features = self.extract_visual_features(crop)
+                    except:
+                        pass
+                
+                # Update object data
+                matched_objects[obj_id] = (label, bbox, conf, current_time, features)
+                unmatched_detections.remove(best_match_idx)
+                
+                # Update consecutive frame counter for matched objects
+                self.object_consecutive_frames[obj_id] += 1
+                
+                # Update position history
+                center = self.get_object_center(bbox)
+                self.object_positions[obj_id].append(center)
+                if len(self.object_positions[obj_id]) > 50:  # Keep recent history
+                    self.object_positions[obj_id].pop(0)
+                
+                # Update size history
+                area = self.get_bbox_area(bbox)
+                self.object_sizes[obj_id].append(area)
+                if len(self.object_sizes[obj_id]) > 20:
+                    self.object_sizes[obj_id].pop(0)
+                
+                # Check if object is static
+                self.is_object_static(obj_id)
+                
+                # Remove from disappeared and occlusion memory
+                self.disappeared.pop(obj_id, None)
+                self.occlusion_memory.pop(obj_id, None)
+                
+                # MODIFIED: Check if should buffer image (instead of immediate save)
+                if self._should_buffer_object(obj_id, detection):
+                    objects_for_buffering.add(obj_id)
         
-        return valid_detections
+        # Attempt occlusion recovery for unmatched detections
+        if frame is not None and self.occlusion_memory:
+            recovery_matches = self.handle_occlusion_recovery(
+                [valid_detections[i] for i in unmatched_detections], frame
+            )
+            
+            for det_idx_in_unmatched, obj_id in recovery_matches.items():
+                actual_det_idx = unmatched_detections[det_idx_in_unmatched]
+                detection = valid_detections[actual_det_idx]
+                label, bbox, conf = detection
+                
+                # Extract features
+                features = None
+                try:
+                    x1, y1, x2, y2 = bbox
+                    crop = frame[y1:y2, x1:x2]
+                    features = self.extract_visual_features(crop)
+                except:
+                    pass
+                
+                # Restore object
+                matched_objects[obj_id] = (label, bbox, conf, current_time, features)
+                unmatched_detections.remove(actual_det_idx)
+                
+                # Update consecutive frame counter for recovered objects
+                self.object_consecutive_frames[obj_id] += 1
+                
+                # Update histories
+                center = self.get_object_center(bbox)
+                self.object_positions[obj_id].append(center)
+                
+                # Remove from occlusion memory
+                self.occlusion_memory.pop(obj_id, None)
+                self.disappeared.pop(obj_id, None)
+                
+                # Check if should buffer
+                if self._should_buffer_object(obj_id, detection):
+                    objects_for_buffering.add(obj_id)
+        
+        # Create new objects for remaining unmatched detections (more conservative)
+        for i in unmatched_detections:
+            detection = valid_detections[i]
+            label, bbox, conf = detection
+            
+            # More stringent criteria for new object creation in strict mode
+            if self.strict_mode:
+                # Check if this detection is too similar to existing objects
+                is_too_similar = False
+                det_center = self.get_object_center(bbox)
+                
+                for existing_obj_data in matched_objects.values():
+                    existing_center = self.get_object_center(existing_obj_data[1])
+                    distance = self.calculate_distance(det_center, existing_center)
+                    
+                    if distance < self.position_threshold * 0.65:  # Very close to existing
+                        is_too_similar = True
+                        break
+                
+                if is_too_similar:
+                    logger.debug(f"Skipping new object creation - too similar to existing")
+                    continue
+            
+            # Create new object
+            new_obj_id = self.next_id
+            self.next_id += 1
+            self.total_objects_created += 1
+            
+            # Extract features
+            features = None
+            if frame is not None:
+                try:
+                    x1, y1, x2, y2 = bbox
+                    crop = frame[y1:y2, x1:x2]
+                    features = self.extract_visual_features(crop)
+                except:
+                    pass
+            
+            matched_objects[new_obj_id] = (label, bbox, conf, current_time, features)
+            
+            # Initialize consecutive frame counter for new objects
+            self.object_consecutive_frames[new_obj_id] = 1
+            
+            # Initialize histories
+            center = self.get_object_center(bbox)
+            self.object_positions[new_obj_id] = [center]
+            self.object_sizes[new_obj_id] = [self.get_bbox_area(bbox)]
+            
+            # Check if should buffer (new objects need min consecutive frames)
+            if self._should_buffer_object(new_obj_id, detection):
+                objects_for_buffering.add(new_obj_id)
+            
+            logger.info(f"Created new object {new_obj_id}: {label} (total created: {self.total_objects_created})")
+        
+        # Handle disappeared objects
+        self._update_disappeared_objects(matched_objects)
+        
+        # Update main objects dictionary
+        self.objects = matched_objects
+        
+        # Periodic cleanup
+        if self.frame_count % 100 == 0:
+            self._cleanup_old_data()
+        
+        return self.objects, objects_for_buffering  # MODIFIED: Return buffering set instead of save set
+    
+    def _should_buffer_object(self, obj_id, detection):
+        """MODIFIED: Determine if object should be buffered for quality assessment"""
+        
+        # Define static objects to exclude from buffering/saving
+        EXCLUDED_STATIC_OBJECTS = {
+            # Indoor static objects
+            'tv', 'television', 'refrigerator', 'fridge', 'chair', 'sofa', 'couch', 
+            'bed', 'microwave', 'oven', 'dining table', 'diningtable',
+            
+            # Outdoor static objects  
+            'traffic light', 'trafficlight', 'fire hydrant', 'firehydrant', 
+            'stop sign', 'stopsign', 'parking meter', 'parkingmeter', 
+            'bench', 'mailbox', 'street sign', 'streetsign'
+        }
+
+        label = detection[0].lower()  # Convert to lowercase for comparison
+    
+        # Check if this object type should be excluded
+        if label in EXCLUDED_STATIC_OBJECTS:
+            logger.debug(f"Object {obj_id} ({label}) excluded from buffering - static object type")
+            return False
+        
+        # Check if object has been consistently tracked for minimum consecutive frames
+        if self.object_consecutive_frames[obj_id] < self.min_consecutive_frames:
+            logger.debug(f"Object {obj_id} not ready for buffering: {self.object_consecutive_frames[obj_id]}/{self.min_consecutive_frames} consecutive frames")
+            return False
+        
+        # Object is ready for buffering
+        return True
     
     def _handle_no_detections(self):
-        """Handle frames with no valid detections"""
+        """Handle frames with no detections"""
         for obj_id in list(self.objects.keys()):
             self.disappeared[obj_id] = self.disappeared.get(obj_id, 0) + 1
             
+            # Reset consecutive frame counter when object disappears
+            self.object_consecutive_frames[obj_id] = 0
+            
+            # Move to occlusion memory if object was static
+            if obj_id in self.stable_objects and obj_id not in self.occlusion_memory:
+                obj_data = self.objects[obj_id]
+                features = obj_data[4] if len(obj_data) > 4 else None
+                self.occlusion_memory[obj_id] = (
+                    obj_data[0], obj_data[1], features, self.frame_count
+                )
+                logger.debug(f"Moved static object {obj_id} to occlusion memory")
+            
+            # Remove if disappeared too long
             if self.disappeared[obj_id] > self.max_disappeared:
-                # Clean up object data
                 self._remove_object(obj_id)
     
     def _update_disappeared_objects(self, matched_objects):
-        """Update tracking for disappeared objects"""
+        """Update disappeared object tracking"""
         for obj_id in list(self.objects.keys()):
             if obj_id not in matched_objects:
                 self.disappeared[obj_id] = self.disappeared.get(obj_id, 0) + 1
                 
-                # Move to ghost memory for occlusion recovery
-                if self.disappeared[obj_id] <= 10:
-                    self.ghost_objects[obj_id] = self.objects[obj_id]
+                # Reset consecutive frame counter for disappeared objects
+                self.object_consecutive_frames[obj_id] = 0
+                
+                # Move static objects to occlusion memory
+                if (obj_id in self.stable_objects and 
+                    obj_id not in self.occlusion_memory and 
+                    self.disappeared[obj_id] <= 10):
+                    
+                    obj_data = self.objects[obj_id]
+                    features = obj_data[4] if len(obj_data) > 4 else None
+                    self.occlusion_memory[obj_id] = (
+                        obj_data[0], obj_data[1], features, self.frame_count
+                    )
                 
                 # Remove if disappeared too long
                 if self.disappeared[obj_id] > self.max_disappeared:
                     self._remove_object(obj_id)
     
     def _remove_object(self, obj_id):
-        """Clean up all data for a removed object"""
-        # Remove from main tracking
+        """Clean up removed object data"""
         self.objects.pop(obj_id, None)
         self.disappeared.pop(obj_id, None)
-        self.ghost_objects.pop(obj_id, None)
+        self.occlusion_memory.pop(obj_id, None)
+        self.object_features.pop(obj_id, None)
+        self.object_positions.pop(obj_id, None)
+        self.object_sizes.pop(obj_id, None)
+        self.stable_objects.discard(obj_id)
         
-        # Clean up enhanced tracking data
-        self.object_filters.pop(obj_id, None)
-        self.object_movement_history.pop(obj_id, None)
-        self.object_capture_flags.pop(obj_id, None)
-        self.object_initial_positions.pop(obj_id, None)
-        self.object_stationary_counts.pop(obj_id, None)
-        self.object_areas.pop(obj_id, None)
-        
-        if self.depth_enabled and self.object_depths:
-            self.object_depths.pop(obj_id, None)
+        # Clean up consecutive frame counter
+        self.object_consecutive_frames.pop(obj_id, None)
     
     def _cleanup_old_data(self):
-        """Periodic cleanup of old tracking data"""
-        try:
-            current_time = time.time()
-            
-            # Clean up old scene buffer entries
-            while (self.scene_buffer and 
-                   current_time - self.scene_buffer[0].get('timestamp', 0) > 60):
-                self.scene_buffer.popleft()
-            
-            # Clean up empty spatial grid cells
-            empty_cells = [key for key, value in self.spatial_grid.items() if not value]
-            for key in empty_cells:
-                del self.spatial_grid[key]
-        except Exception as e:
-            print(f"[CLEANUP] Cleanup error: {e}")
+        """Periodic cleanup of old data"""
+        current_frame = self.frame_count
+        
+        # Clean old occlusion memory
+        expired_occlusions = []
+        for obj_id, (_, _, _, timestamp) in self.occlusion_memory.items():
+            if current_frame - timestamp > self.occlusion_timeout:
+                expired_occlusions.append(obj_id)
+        
+        for obj_id in expired_occlusions:
+            self.occlusion_memory.pop(obj_id, None)
+            logger.debug(f"Expired occlusion memory for object {obj_id}")
     
     def get_tracking_stats(self):
         """Get comprehensive tracking statistics"""
-        stats = {
+        return {
             'active_objects': len(self.objects),
             'disappeared_objects': len(self.disappeared),
-            'ghost_objects': len(self.ghost_objects),
-            'total_captured': sum(1 for flag in self.object_capture_flags.values() if flag),
+            'static_objects': len(self.stable_objects),
+            'occluded_objects': len(self.occlusion_memory),
+            'total_created': self.total_objects_created,
+            'id_switches': self.id_switches,
             'frame_count': self.frame_count,
-            'spatial_grid_cells': len(self.spatial_grid)
+            'objects_ready_for_buffering': len([obj_id for obj_id, count in self.object_consecutive_frames.items() 
+                                             if count >= self.min_consecutive_frames])
         }
-        return stats
 
-# Asynchronous image saving
-def async_image_saver(save_queue, save_dir):
-    """Background thread for saving images asynchronously"""
-    while True:
+class EnhancedImageSaver:
+    """MODIFIED: Enhanced image saver with quality-based selection and metadata generation"""
+    
+    def __init__(self, save_dir, max_workers=2):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(exist_ok=True)
+        
+        self.save_queue = queue.Queue(maxsize=50)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.running = True
+        
+        self.saver_thread = threading.Thread(target=self._save_worker, daemon=True)
+        self.saver_thread.start()
+        
+        # Track saved content to avoid duplicates
+        self.saved_hashes = set()
+        
+        logger.info(f"Enhanced image saver initialized with metadata support")
+    
+    def _calculate_image_hash(self, image):
+        """Calculate hash for duplicate detection"""
         try:
-            save_data = save_queue.get(timeout=1)
-            if save_data is None:  # Shutdown signal
-                break
+            small = cv2.resize(image, (32, 32))
+            return hashlib.md5(small.tobytes()).hexdigest()[:12]
+        except:
+            return str(time.time())
+    
+    def _generate_metadata_content(self, metadata):
+        """Generate human-readable metadata content"""
+        try:
+            content = []
+            content.append(f"Object Detection Metadata")
+            content.append(f"========================")
+            content.append(f"")
+            content.append(f"Object ID: {metadata['object_id']}")
+            content.append(f"Class Label: {metadata['label']}")
+            content.append(f"Detection Confidence: {metadata['confidence']:.3f}")
+            content.append(f"Frame Number: {metadata['frame_count']}")
+            content.append(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata['timestamp']))}")
             
-            crop, filename, obj_id, label = save_data
-            filepath = os.path.join(save_dir, filename)
+            # NEW: Enhanced metadata for save reason and total frames
+            if 'save_reason' in metadata:
+                content.append(f"Save Reason: {metadata['save_reason'].upper()}")
+            if 'total_frames_when_saved' in metadata:
+                content.append(f"Total Frames Tracked: {metadata['total_frames_when_saved']}")
             
-            # Optimize image for storage
-            if args.pi_mode:
-                # Resize if too large
-                h, w = crop.shape[:2]
-                if max(h, w) > 416:  # Optimized max size
-                    scale = 416 / max(h, w)
-                    new_w, new_h = int(w * scale), int(h * scale)
-                    crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                
-                # Use lower quality to save space
-                quality = [cv2.IMWRITE_JPEG_QUALITY, 85]
+            content.append(f"")
+            content.append(f"Bounding Box Coordinates:")
+            x1, y1, x2, y2 = metadata['bbox']
+            content.append(f"  Top-left: ({x1}, {y1})")
+            content.append(f"  Bottom-right: ({x2}, {y2})")
+            content.append(f"  Width: {x2 - x1} pixels")
+            content.append(f"  Height: {y2 - y1} pixels")
+            content.append(f"  Area: {(x2 - x1) * (y2 - y1)} pixels")
+            content.append(f"")
+            content.append(f"Image Quality Assessment:")
+            content.append(f"  Overall Quality Score: {metadata['quality_score']:.3f}")
+            
+            if 'quality_details' in metadata and metadata['quality_details']:
+                details = metadata['quality_details']
+                content.append(f"  Sharpness Score: {details.get('sharpness', 0):.3f}")
+                content.append(f"  Brightness Score: {details.get('brightness', 0):.3f}")
+                content.append(f"  Size Quality Score: {details.get('size_quality', 0):.3f}")
+                content.append(f"  Face Detected: {'Yes' if details.get('face_detected', False) else 'No'}")
+                content.append(f"  Bounding Box Area: {details.get('bbox_area', 0)} pixels")
+            
+            content.append(f"")
+            content.append(f"Selection Criteria:")
+            if metadata.get('save_reason') == 'disappeared':
+                content.append(f"  This image was selected as the best quality representation")
+                content.append(f"  of an object that disappeared from the scene after being")
+                content.append(f"  tracked for {metadata.get('total_frames_when_saved', 0)} total frames.")
+                content.append(f"  Selection prioritized anomaly detection significance.")
+            elif metadata.get('save_reason') == 'periodic':
+                content.append(f"  This image was selected during periodic saving of a")
+                content.append(f"  long-duration object to capture potential changes or")
+                content.append(f"  anomalies over time. Object had been tracked for")
+                content.append(f"  {metadata.get('total_frames_when_saved', 0)} total frames at save time.")
             else:
-                quality = [cv2.IMWRITE_JPEG_QUALITY, 95]
+                content.append(f"  This image was selected as the highest quality")
+                content.append(f"  representation of this object from multiple frames.")
             
-            success = cv2.imwrite(filepath, crop, quality)
-            if success:
-                print(f"[SAVED] {filename} - ID:{obj_id} - Size: {crop.shape[1]}x{crop.shape[0]}")
-            else:
-                print(f"[ERROR] Failed to save {filename}")
+            content.append(f"  Selection based on sharpness, brightness, size,")
+            content.append(f"  and face detection (for persons/animals).")
             
-            save_queue.task_done()
+            return "\n".join(content)
             
         except Exception as e:
-            if "Empty" not in str(e):  # Ignore timeout exceptions
-                print(f"[ERROR] Image save failed: {e}")
-
-# Main execution
-def main():
-    try:
-        # Initialize model with CPU-only execution
-        print("[INIT] Loading YOLO model...")
-        model = YOLO(args.model)
-        
-        # Force CPU usage to avoid CUDA errors
-        model.to('cpu')
-        
-        if args.pi_mode:
-            # Pi-specific optimizations
+            logger.error(f"Failed to generate metadata content: {e}")
+            return f"Metadata generation failed: {e}"
+    
+    def _save_worker(self):
+        """Background thread for saving images and metadata"""
+        while self.running:
             try:
-                model.fuse()  # Fuse layers for speed
-            except:
-                print("[PI-OPT] Model fusion failed, continuing without fusion")
-            os.environ['OMP_NUM_THREADS'] = '4'  # Optimize for Pi's 4 cores
+                save_data = self.save_queue.get(timeout=1.0)
+                if save_data is None:
+                    break
+                
+                image, filename, metadata = save_data
+                
+                # Check for duplicates
+                img_hash = self._calculate_image_hash(image)
+                if img_hash in self.saved_hashes:
+                    logger.debug(f"Skipped duplicate: {filename}")
+                    continue
+                
+                # Save image
+                file_path = self.save_dir / 'images'/filename
+                params = [cv2.IMWRITE_JPEG_QUALITY, 95]  # Higher quality for best images
+                
+                success = cv2.imwrite(str(file_path), image, params)
+                
+                if success:
+                    self.saved_hashes.add(img_hash)
+                    
+                    # Save metadata file
+                    metadata_filename = filename.rsplit('.', 1)[0] + '.txt'
+                    metadata_path = self.save_dir /'metadata'/ metadata_filename
+                    
+                    try:
+                        metadata_content = self._generate_metadata_content(metadata)
+                        with open(metadata_path, 'w', encoding='utf-8') as f:
+                            f.write(metadata_content)
+                        
+                        save_reason = metadata.get('save_reason', 'standard')
+                        logger.info(f"SAVED BEST IMAGE: {filename} (quality: {metadata['quality_score']:.3f}, reason: {save_reason})")
+                        logger.info(f"SAVED METADATA: {metadata_filename}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to save metadata for {filename}: {e}")
+                        # Still consider image save successful even if metadata fails
+                    
+                else:
+                    logger.error(f"Failed to save image: {filename}")
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Save worker error: {e}")
+    
+    def save_best_image(self, image, filename, metadata):
+        """Queue best quality image for saving with metadata"""
+        try:
+            if not filename.endswith(('.jpg', '.jpeg', '.png')):
+                filename += '.jpg'
+            
+            save_data = (image.copy(), filename, metadata)
+            self.save_queue.put_nowait(save_data)
+            return True
+        except queue.Full:
+            logger.warning(f"Save queue full: {filename}")
+            return False
+    
+    def save_initial_scene(self, frame):
+        """Save initial scene"""
+        try:
+            scene_path = self.save_dir / "initial_scene.jpg"
+            success = cv2.imwrite(str(scene_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if success:
+                logger.info(f"Initial scene saved: {scene_path}")
+            return success
+        except Exception as e:
+            logger.error(f"Scene save error: {e}")
+            return False
+    
+    def shutdown(self):
+        """Graceful shutdown"""
+        self.running = False
+        self.save_queue.put(None)
+        self.saver_thread.join(timeout=5.0)
+        self.executor.shutdown(wait=True)
+
+# Signal handler for graceful shutdown
+def signal_handler(signum, frame):
+    global running
+    logger.info("Shutdown signal received")
+    running = False
+
+def main():
+    global running
+    running = True
+    
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        logger.info("Initializing Enhanced Object Tracking System with Anomaly-Aware Image Selection...")
         
-        # Setup directories
+        # Create directories
         os.makedirs(args.save_dir, exist_ok=True)
+        os.makedirs(os.path.join(args.save_dir, 'images'), exist_ok=True)
+        os.makedirs(os.path.join(args.save_dir, 'metadata'), exist_ok=True)
+
+        # Initialize model
+        logger.info(f"Loading model: {args.model}")
+        model = YOLO(args.model)
+        model.to('cpu')  # Force CPU to avoid CUDA issues
         
-        # Initialize enhanced tracker
-        tracker = EnhancedObjectTracker(
-            depth_enabled=args.depth_camera,
-            max_disappeared=20 if args.pi_mode else 30,
-            movement_threshold=20 if args.pi_mode else 25
+        # Initialize components
+        image_saver = EnhancedImageSaver(args.save_dir, max_workers=args.max_workers)
+        tracker = RobustObjectTracker(strict_mode=args.strict_tracking)
+        image_buffer = IntelligentImageBuffer(
+            max_buffer_size=args.buffer_size,
+            save_delay_frames=args.save_delay,
+            min_total_frames_for_disappeared=args.min_total_frames,  # NEW
+            periodic_save_interval=args.periodic_save_interval  # NEW
         )
+
+        previous_active_objects = set()
+        # Video capture
+        source = int(args.source) if args.source.isdigit() else args.source
+        cap = cv2.VideoCapture(source)
         
-        # Setup video capture
-        cap = cv2.VideoCapture(int(args.source) if args.source.isdigit() else args.source)
-        
-        if args.pi_mode:
-            # Pi Camera optimized settings
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 10)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        else:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            cap.set(cv2.CAP_PROP_FPS, 15)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Optimized settings
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 15)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         if not cap.isOpened():
-            raise ValueError("Cannot open video source")
+            raise ValueError(f"Cannot open video source: {args.source}")
         
-        # Start async image saver
-        save_queue = Queue(maxsize=20)
-        saver_thread = threading.Thread(
-            target=async_image_saver, 
-            args=(save_queue, args.save_dir),
-            daemon=True
-        )
-        saver_thread.start()
+        logger.info("Enhanced anomaly-aware system initialized successfully")
+        logger.info(f"Configuration:")
+        logger.info(f"  - Image buffer size: {args.buffer_size}")
+        logger.info(f"  - Save delay: {args.save_delay} frames")
+        logger.info(f"  - Min total frames for disappeared objects: {args.min_total_frames}")
+        logger.info(f"  - Periodic save interval: {args.periodic_save_interval} frames")
         
-        print(f"[START] Enhanced tracking started - Pi mode: {args.pi_mode}")
-        
+        # Performance tracking
         frame_count = 0
-        fps_counter = deque(maxlen=30)
-        last_stats_time = time.time()
+        fps_times = deque(maxlen=30)
+        last_stats = time.time()
+        scene_saved = False
         
-        while cap.isOpened():
+        while running and cap.isOpened():
             frame_start = time.time()
+            
             ret, frame = cap.read()
             if not ret:
+                logger.warning("Failed to read frame")
                 break
             
             frame_count += 1
             
-            # Dynamic processing based on Pi mode
-            if args.pi_mode:
-                should_process = (frame_count % 2 == 0)  # Every 2nd frame
-            else:
-                should_process = True  # Every frame
-            
-            if not should_process:
-                cv2.imshow("Enhanced Object Tracking", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-                continue
+            # Save initial scene
+            if args.save_scene and not scene_saved:
+                image_saver.save_initial_scene(frame)
+                scene_saved = True
             
             try:
-                # YOLO detection with fixed device parameter
+                # YOLO detection
                 results = model(
                     frame, 
-                    conf=args.confidence, 
-                    iou=args.iou_threshold, 
+                    conf=args.confidence,
+                    iou=args.iou_threshold,
                     verbose=False,
-                    device='cpu'  # Always use CPU to avoid CUDA errors
+                    device='cpu',
+                    imgsz=args.detection_size
                 )
                 
                 # Extract detections
@@ -740,7 +1395,7 @@ def main():
                             if conf >= args.confidence:
                                 x1, y1, x2, y2 = map(int, box)
                                 
-                                # Validate bounding box
+                                # Validate bbox
                                 if (x2 > x1 and y2 > y1 and 
                                     x1 >= 0 and y1 >= 0 and 
                                     x2 < frame.shape[1] and y2 < frame.shape[0]):
@@ -749,290 +1404,298 @@ def main():
                                     detections.append((label, (x1, y1, x2, y2), float(conf)))
                 
                 # Update tracker
-                tracked_objects, objects_to_save = tracker.update(detections, frame)
+                tracked_objects, objects_for_buffering = tracker.update(detections, frame)
+                current_active_objects = set(tracked_objects.keys())
                 
-                # Visualization and saving
-                for obj_id, obj_data in tracked_objects.items():
-                    try:
-                        label, bbox, conf, timestamp = obj_data
-                        x1, y1, x2, y2 = bbox
-                        center = tracker.get_object_center(bbox)
-                        
-                        # Calculate movement for display
-                        total_movement = tracker.calculate_total_movement(obj_id, center)
-                        is_captured = tracker.object_capture_flags.get(obj_id, False)
-                        
-                        # Color coding based on status
-                        if is_captured:
-                            color = (0, 255, 0)  # Green - captured
-                            status = "CAPTURED"
-                        elif total_movement > tracker.movement_threshold:
-                            color = (0, 165, 255)  # Orange - moving
-                            status = f"MOVING({total_movement:.1f})"
-                        else:
-                            color = (255, 255, 0)  # Cyan - tracking
-                            status = f"TRACK({total_movement:.1f})"
-                        
-                        # Draw bounding box and tracking info
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        
-                        # Enhanced labeling with tracking info
-                        text_lines = [
-                            f"{label}[{obj_id}] {conf:.2f}",
-                            f"{status}"
-                        ]
-                        
-                        # Add Kalman prediction if available
-                        if obj_id in tracker.object_filters:
-                            predicted = tracker.object_filters[obj_id].predict()
-                            if predicted is not None:
-                                pred_x, pred_y = map(int, predicted)
-                                cv2.circle(frame, (pred_x, pred_y), 3, (255, 0, 255), -1)  # Magenta prediction
-                        
-                        # Draw text with background for better visibility
-                        y_offset = y1 - 10
-                        for line in text_lines:
-                            text_size = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-                            cv2.rectangle(frame, (x1, y_offset - text_size[1] - 2), 
-                                        (x1 + text_size[0] + 4, y_offset + 2), color, -1)
-                            cv2.putText(frame, line, (x1 + 2, y_offset), 
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-                            y_offset -= (text_size[1] + 4)
-                        
-                        # Draw movement trail
-                        if obj_id in tracker.object_movement_history:
-                            trail = list(tracker.object_movement_history[obj_id])
-                            if len(trail) > 1:
-                                for i in range(1, len(trail)):
-                                    cv2.line(frame, trail[i-1], trail[i], color, 1)
-                    
-                    except Exception as e:
-                        print(f"[VIZ] Visualization error for object {obj_id}: {e}")
-                        continue
-                
-                # Asynchronous image saving
-                for obj_id in objects_to_save:
+                # Buffer images for active objects
+                for obj_id in objects_for_buffering:
                     if obj_id in tracked_objects:
                         try:
-                            label, bbox, conf, _ = tracked_objects[obj_id]
+                            label, bbox, conf, timestamp, _ = tracked_objects[obj_id]
                             x1, y1, x2, y2 = bbox
-                            
-                            # Extract and prepare crop
                             crop = frame[y1:y2, x1:x2].copy()
                             if crop.size > 0:
-                                # Generate unique filename with movement info
-                                movement = tracker.calculate_total_movement(
-                                    obj_id, tracker.get_object_center(bbox)
-                                )
-                                timestamp_str = str(int(time.time() * 1000))
-                                filename = f"{label}_ID{obj_id}_mv{movement:.1f}_{timestamp_str}.jpg"
-                                
-                                # Add to save queue (non-blocking)
-                                if not save_queue.full():
-                                    save_queue.put((crop, filename, obj_id, label))
-                                else:
-                                    print(f"[WARNING] Save queue full, skipping {filename}")
-                                    
+                                image_buffer.add_image(obj_id, crop, bbox, conf, label, frame_count)
                         except Exception as e:
-                            print(f"[ERROR] Failed to prepare save for object {obj_id}: {e}")
+                            logger.error(f"Buffering failed for object {obj_id}: {e}")
                 
-                # Enhanced status display
-                stats = tracker.get_tracking_stats()
-                status_lines = [
-                    f"Frame: {frame_count} | Active: {stats['active_objects']} | "
-                    f"Disappeared: {stats['disappeared_objects']} | "
-                    f"Captured: {stats['total_captured']}",
-                    f"Grid Cells: {stats['spatial_grid_cells']} | "
-                    f"Pi Mode: {args.pi_mode} | "
-                    f"Scene: {'✓' if tracker.scene_captured else '✗'}"
-                ]
+                # FIXED: Improved disappeared object detection
+                if frame_count > 1:  # Skip first frame as we need previous state
+                    # Find objects that were active in previous frame but not current frame
+                    newly_disappeared = previous_active_objects - current_active_objects
+                    
+                    # Mark newly disappeared objects in buffer
+                    for obj_id in newly_disappeared:
+                        if obj_id in image_buffer.object_buffers:
+                            image_buffer.mark_object_disappeared(obj_id, frame_count)
+                            logger.debug(f"Object {obj_id} newly disappeared at frame {frame_count}")
                 
-                y_pos = 25
-                for line in status_lines:
-                    # Background for better visibility
-                    text_size = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                    cv2.rectangle(frame, (10, y_pos - text_size[1] - 5), 
-                                (10 + text_size[0] + 10, y_pos + 5), (0, 0, 0), -1)
-                    cv2.putText(frame, line, (15, y_pos), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    y_pos += 30
+                # ADDITIONAL: Also check tracker's disappeared objects and mark them in buffer
+                for obj_id, disappeared_count in tracker.disappeared.items():
+                    # Mark object as disappeared if it has a disappeared count but isn't yet marked in buffer
+                    if obj_id not in image_buffer.disappeared_objects and obj_id in image_buffer.object_buffers:
+                        # Calculate when it actually disappeared (current frame - disappeared count)
+                        disappeared_frame = frame_count - disappeared_count
+                        image_buffer.mark_object_disappeared(obj_id, disappeared_frame)
+                        logger.debug(f"Tracker disappeared object {obj_id} marked in buffer (disappeared at frame {disappeared_frame})")
                 
-                # FPS calculation and display
-                frame_time = time.time() - frame_start
-                if frame_time > 0:
-                    fps_counter.append(1.0 / frame_time)
-                avg_fps = sum(fps_counter) / len(fps_counter) if fps_counter else 0
+                # Update previous objects for next frame
+                previous_active_objects = current_active_objects.copy()
+
+                # Process ready objects for saving
+                ready_objects = image_buffer.get_objects_ready_for_saving(frame_count)
+                for obj_id, save_reason in ready_objects:
+                    success = image_buffer.save_and_cleanup_object(obj_id, save_reason, image_saver)
+                    if success:
+                        if save_reason == 'disappeared':
+                            logger.info(f"Disappeared object {obj_id} saved successfully")
+                        elif save_reason == 'periodic':
+                            logger.info(f"Periodic save completed for long-duration object {obj_id}")
                 
-                cv2.putText(frame, f"FPS: {avg_fps:.1f}", (15, frame.shape[0] - 20), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                if frame_count % 100 == 0 and image_buffer.disappeared_objects:
+                    image_buffer.debug_disappeared_objects(frame_count)
+
+                # NEW: Periodic buffer cleanup
+                if frame_count % 200 == 0:  # Every 200 frames (about 20 seconds at 10fps)
+                    image_buffer.cleanup_old_buffers()
+                
+                # Visualization (if GUI enabled)
+                if not args.no_gui:
+                    display_frame = frame.copy()
+                    
+                    # Draw tracking results
+                    for obj_id, obj_data in tracked_objects.items():
+                        try:
+                            label, bbox, conf, timestamp, _ = obj_data
+                            x1, y1, x2, y2 = bbox
+                            
+                            # Color coding
+                            if obj_id in tracker.stable_objects:
+                                color = (0, 255, 0)  # Green for static
+                                status = "STATIC"
+                            elif obj_id in tracker.occlusion_memory:
+                                color = (255, 0, 255)  # Magenta for occluded
+                                status = "OCCLUDED"
+                            else:
+                                color = (255, 255, 0)  # Cyan for tracking
+                                status = "TRACKING"
+                            
+                            # Draw bounding box
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                            
+                            # Show enhanced status information
+                            consecutive_frames = tracker.object_consecutive_frames.get(obj_id, 0)
+                            ready_for_buffer = consecutive_frames >= tracker.min_consecutive_frames
+                            
+                            # Check buffer status
+                            in_buffer = obj_id in image_buffer.object_buffers
+                            buffer_size = len(image_buffer.object_buffers.get(obj_id, []))
+                            total_frames_seen = image_buffer.object_total_frames.get(obj_id, 0)
+                            
+                            # Check if object is ready for periodic save
+                            ready_for_periodic = (obj_id not in image_buffer.disappeared_objects and 
+                                                image_buffer._should_periodic_save(obj_id, frame_count))
+                            
+                            if ready_for_buffer and in_buffer:
+                                if ready_for_periodic:
+                                    buffer_status = f"BUF:{buffer_size}|PERIODIC"
+                                else:
+                                    buffer_status = f"BUF:{buffer_size}|T{total_frames_seen}"
+                            elif ready_for_buffer:
+                                buffer_status = "READY"
+                            else:
+                                buffer_status = f"{consecutive_frames}/{tracker.min_consecutive_frames}"
+                            
+                            # Draw label with enhanced information
+                            text = f"{label}[{obj_id}] {conf:.2f} - {status} ({buffer_status})"
+                            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                            
+                            # Background for text
+                            cv2.rectangle(display_frame, 
+                                        (x1, y1 - text_size[1] - 10), 
+                                        (x1 + text_size[0] + 4, y1), 
+                                        color, -1)
+                            
+                            cv2.putText(display_frame, text, (x1 + 2, y1 - 5), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                            
+                            # Draw center point
+                            center = tracker.get_object_center(bbox)
+                            cv2.circle(display_frame, center, 3, color, -1)
+                            
+                            # NEW: Visual indicator for objects ready for periodic save
+                            if ready_for_periodic:
+                                cv2.circle(display_frame, (x2 - 10, y1 + 10), 5, (0, 255, 255), -1)  # Yellow dot
+                            
+                        except Exception as e:
+                            logger.error(f"Visualization error for {obj_id}: {e}")
+                    
+                    # Draw enhanced statistics
+                    tracker_stats = tracker.get_tracking_stats()
+                    buffer_stats = image_buffer.get_buffer_stats()
+                    
+                    stats_text = [
+                        f"Frame: {frame_count}",
+                        f"Active: {tracker_stats['active_objects']}",
+                        f"Static: {tracker_stats['static_objects']}",
+                        f"Buffered Images: {buffer_stats['total_buffered_images']}",
+                        f"Images Saved: {buffer_stats['total_images_saved']}",
+                        f"Disappeared Saved: {buffer_stats['disappeared_objects_saved']}",  # NEW
+                        f"Periodic Saves: {buffer_stats['periodic_saves']}",  # NEW
+                        f"Objects Processed: {buffer_stats['objects_processed']}"
+                    ]
+                    
+                    y_pos = 30
+                    for text in stats_text:
+                        cv2.putText(display_frame, text, (10, y_pos), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        cv2.putText(display_frame, text, (10, y_pos), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+                        y_pos += 30
+                    
+                    # FPS display
+                    frame_time = time.time() - frame_start
+                    if frame_time > 0:
+                        fps_times.append(1.0 / frame_time)
+                    
+                    if fps_times:
+                        avg_fps = sum(fps_times) / len(fps_times)
+                        cv2.putText(display_frame, f"FPS: {avg_fps:.1f}", 
+                                  (10, display_frame.shape[0] - 20),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # Show frame
+                    cv2.imshow("Enhanced Anomaly-Aware Object Tracking", display_frame)
+                    
+                    # Handle key presses
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        running = False
+                        break
+                    elif key == ord('r'):  # Reset tracker
+                        tracker = RobustObjectTracker(strict_mode=args.strict_tracking)
+                        image_buffer = IntelligentImageBuffer(
+                            max_buffer_size=args.buffer_size,
+                            save_delay_frames=args.save_delay,
+                            min_total_frames_for_disappeared=args.min_total_frames,
+                            periodic_save_interval=args.periodic_save_interval
+                        )
+                        logger.info("Tracker and buffer reset")
+                    elif key == ord('s'):  # Save current scene
+                        scene_name = f"scene_{int(time.time())}.jpg"
+                        cv2.imwrite(os.path.join(args.save_dir, scene_name), frame)
+                        logger.info(f"Scene saved: {scene_name}")
+                    elif key == ord('f'):  # Force save all buffered objects
+                        logger.info("Force saving all buffered objects...")
+                        for obj_id in list(image_buffer.object_buffers.keys()):
+                            if len(image_buffer.object_buffers[obj_id]) > 0:
+                                success = image_buffer.save_and_cleanup_object(obj_id, 'manual', image_saver)
+                                if success:
+                                    logger.info(f"Manually saved object {obj_id}")
                 
                 # Periodic statistics logging
-                if time.time() - last_stats_time > 10:  # Every 10 seconds
-                    print(f"[STATS] {stats} | FPS: {avg_fps:.1f}")
-                    last_stats_time = time.time()
+                if time.time() - last_stats > 10:
+                    tracker_stats = tracker.get_tracking_stats()
+                    buffer_stats = image_buffer.get_buffer_stats()
+                    avg_fps = sum(fps_times) / len(fps_times) if fps_times else 0
+                    
+                    logger.info(f"Tracking: {tracker_stats}")
+                    logger.info(f"Enhanced Buffer: {buffer_stats} | FPS: {avg_fps:.1f}")
+                    last_stats = time.time()
                 
             except Exception as e:
-                print(f"[ERROR] Frame processing failed: {e}")
+                logger.error(f"Frame processing error: {e}")
                 continue
-            
-            # Display frame
-            cv2.imshow("Enhanced Object Tracking", frame)
-            
-            # Handle key presses
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('s'):  # Manual scene capture
-                try:
-                    scene_path = os.path.join(args.save_dir, f"manual_scene_{int(time.time())}.jpg")
-                    cv2.imwrite(scene_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    print(f"[MANUAL] Scene saved: {scene_path}")
-                except Exception as e:
-                    print(f"[ERROR] Manual scene capture failed: {e}")
-            elif key == ord('r'):  # Reset tracker
-                try:
-                    tracker = EnhancedObjectTracker(
-                        depth_enabled=args.depth_camera,
-                        max_disappeared=20 if args.pi_mode else 30,
-                        movement_threshold=20 if args.pi_mode else 25
-                    )
-                    print("[RESET] Tracker reset")
-                except Exception as e:
-                    print(f"[ERROR] Tracker reset failed: {e}")
     
     except Exception as e:
-        print(f"[FATAL ERROR] {e}")
+        logger.error(f"Fatal error: {e}")
         import traceback
         traceback.print_exc()
     
     finally:
+        logger.info("Shutting down enhanced anomaly-aware system...")
+        
+        # NEW: Enhanced shutdown - save all remaining buffered images with appropriate reasons
+        if 'image_buffer' in locals():
+            logger.info("Saving remaining buffered images...")
+            
+            # Save all remaining objects as 'shutdown' saves
+            saved_count = 0
+            for obj_id in list(image_buffer.object_buffers.keys()):
+                try:
+                    # Determine save reason for remaining objects
+                    if obj_id in image_buffer.disappeared_objects:
+                        save_reason = 'disappeared'
+                    elif image_buffer.object_total_frames.get(obj_id, 0) >= image_buffer.min_total_frames_for_disappeared:
+                        save_reason = 'shutdown'
+                    else:
+                        save_reason = 'shutdown_minimal'  # Even save objects with few frames during shutdown
+                    
+                    success = image_buffer.save_and_cleanup_object(obj_id, save_reason, image_saver)
+                    if success:
+                        saved_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"Failed to save remaining image for object {obj_id}: {e}")
+            
+            logger.info(f"Saved {saved_count} remaining objects during shutdown")
+        
         # Cleanup
-        print("[CLEANUP] Shutting down...")
-        
-        # Stop async saver
-        if 'save_queue' in locals():
-            try:
-                save_queue.put(None)  # Shutdown signal
-            except:
-                pass
-        
         if 'cap' in locals():
             cap.release()
-        cv2.destroyAllWindows()
         
-        # Save final statistics
-        if 'tracker' in locals():
+        if not args.no_gui:
+            cv2.destroyAllWindows()
+        
+        if 'image_saver' in locals():
+            image_saver.shutdown()
+        
+        # Save enhanced final statistics
+        if 'tracker' in locals() and 'image_buffer' in locals():
             try:
-                final_stats = tracker.get_tracking_stats()
-                stats_file = os.path.join(args.save_dir, f"tracking_stats_{int(time.time())}.json")
+                tracker_stats = tracker.get_tracking_stats()
+                buffer_stats = image_buffer.get_buffer_stats()
                 
-                # Prepare serializable stats
-                serializable_stats = {
-                    'final_stats': final_stats,
-                    'total_frames_processed': frame_count,
-                    'pi_mode': args.pi_mode,
-                    'model_used': args.model,
-                    'confidence_threshold': args.confidence,
-                    'session_duration': time.time() - (last_stats_time - 10),
-                    'objects_captured': final_stats.get('total_captured', 0)
+                final_stats = {
+                    'tracker_stats': tracker_stats,
+                    'buffer_stats': buffer_stats,
+                    'total_frames': frame_count,
+                    'configuration': {
+                        'strict_mode': args.strict_tracking,
+                        'confidence_threshold': args.confidence,
+                        'buffer_size': args.buffer_size,
+                        'save_delay_frames': args.save_delay,
+                        'min_total_frames_for_disappeared': args.min_total_frames,  # NEW
+                        'periodic_save_interval': args.periodic_save_interval,  # NEW
+                        'min_consecutive_frames_for_buffering': tracker.min_consecutive_frames
+                    },
+                    'session_duration': time.time() - (last_stats - 10),
+                    'anomaly_detection_metrics': {  # NEW: Anomaly-specific metrics
+                        'disappeared_objects_saved': buffer_stats.get('disappeared_objects_saved', 0),
+                        'periodic_saves': buffer_stats.get('periodic_saves', 0),
+                        'objects_ever_saved': buffer_stats.get('objects_ever_saved', 0),
+                        'total_anomaly_events': buffer_stats.get('disappeared_objects_saved', 0) + buffer_stats.get('periodic_saves', 0)
+                    }
                 }
                 
+                stats_file = os.path.join(args.save_dir, f"anomaly_aware_final_stats_{int(time.time())}.json")
+                
                 with open(stats_file, 'w') as f:
-                    json.dump(serializable_stats, f, indent=2)
-                print(f"[STATS] Final statistics saved: {stats_file}")
+                    json.dump(final_stats, f, indent=2)
+                
+                logger.info(f"Enhanced final statistics saved: {stats_file}")
+                logger.info(f"Anomaly-Aware Session Summary:")
+                logger.info(f"  - Total frames processed: {frame_count}")
+                logger.info(f"  - Total objects created: {tracker_stats.get('total_created', 0)}")
+                logger.info(f"  - Total images buffered: {buffer_stats.get('total_images_buffered', 0)}")
+                logger.info(f"  - Best images saved: {buffer_stats.get('total_images_saved', 0)}")
+                logger.info(f"  - Disappeared objects saved: {buffer_stats.get('disappeared_objects_saved', 0)}")
+                logger.info(f"  - Periodic saves: {buffer_stats.get('periodic_saves', 0)}")
+                logger.info(f"  - Objects fully processed: {buffer_stats.get('objects_processed', 0)}")
+                logger.info(f"  - Total anomaly events detected: {buffer_stats.get('disappeared_objects_saved', 0) + buffer_stats.get('periodic_saves', 0)}")
+                
             except Exception as e:
-                print(f"[ERROR] Failed to save stats: {e}")
-
-# Utility functions for system optimization
-def optimize_for_system():
-    """Apply system-specific optimizations"""
-    try:
-        # Set threading for optimal performance
-        cv2.setNumThreads(4)  # Use 4 cores
-        
-        # Set environment variables for better performance
-        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp'
-        
-        print("[OPT] System optimizations applied")
-        return True
-    except Exception as e:
-        print(f"[OPT] Optimization failed: {e}")
-        return False
-
-# System monitoring class
-class SystemMonitor:
-    """Monitor system resources and performance"""
-    
-    def __init__(self):
-        self.start_time = time.time()
-        self.frame_times = deque(maxlen=100)
-        self.memory_usage = deque(maxlen=50)
-        
-    def log_frame_time(self, frame_time):
-        self.frame_times.append(frame_time)
-        
-    def get_average_fps(self):
-        if not self.frame_times:
-            return 0
-        avg_time = sum(self.frame_times) / len(self.frame_times)
-        return 1.0 / avg_time if avg_time > 0 else 0
-        
-    def check_memory_usage(self):
-        # Simplified memory check without external dependencies
-        return True
-            
-    def get_runtime_stats(self):
-        runtime = time.time() - self.start_time
-        avg_fps = self.get_average_fps()
-        
-        stats = {
-            'runtime_seconds': runtime,
-            'average_fps': avg_fps,
-            'frames_processed': len(self.frame_times),
-            'memory_usage_avg': 0  # Simplified without psutil
-        }
-        return stats
-
-# Additional utility functions
-def create_optimized_cap(source):
-    """Create optimized video capture"""
-    try:
-        cap = cv2.VideoCapture(int(source) if source.isdigit() else source)
-        
-        # Basic optimizations that work on most systems
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize delay
-        
-        return cap
-    except Exception as e:
-        print(f"[CAP] Failed to create optimized capture: {e}")
-        return None
-
-def validate_model_path(model_path):
-    """Validate that the model file exists and is accessible"""
-    if not os.path.exists(model_path):
-        print(f"[ERROR] Model file not found: {model_path}")
-        return False
-    
-    if not os.path.isfile(model_path):
-        print(f"[ERROR] Model path is not a file: {model_path}")
-        return False
-    
-    # Check file extension
-    valid_extensions = ['.pt', '.onnx', '.engine']
-    if not any(model_path.lower().endswith(ext) for ext in valid_extensions):
-        print(f"[WARNING] Unusual model file extension: {model_path}")
-    
-    return True
+                logger.error(f"Failed to save enhanced final stats: {e}")
 
 if __name__ == "__main__":
-    # Validate model path before starting
-    if not validate_model_path(args.model):
-        print("[FATAL] Cannot proceed without valid model file")
-        exit(1)
-    
-    # Apply system optimizations
-    print("[OPT] Applying system optimizations...")
-    optimize_for_system()
-    
-    # Start main tracking system
     main()
